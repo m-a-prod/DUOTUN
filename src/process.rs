@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,9 +62,6 @@ impl AppRules {
     }
 }
 
-/// How fresh a socket table must be before a miss triggers a rescan.
-const RESCAN_AFTER: Duration = Duration::from_millis(25);
-
 #[derive(Default)]
 struct Table {
     ports: HashMap<u16, u32>,
@@ -73,6 +70,8 @@ struct Table {
 
 #[derive(Default)]
 pub struct Finder {
+    /// Only for logging decisions.
+    rules: Option<AppRules>,
     tcp: Mutex<Table>,
     udp: Mutex<Table>,
     paths: Mutex<HashMap<u32, (Option<PathBuf>, Instant)>>,
@@ -80,17 +79,25 @@ pub struct Finder {
 
 impl Finder {
     /// Executable of the process owning the local socket `local`. Blocking.
+    ///
+    /// On a miss the table is rescanned, unless another lookup already
+    /// rescanned it after this one started (the socket existed by then, so
+    /// a second scan would not find it either). Lookups queue on the lock,
+    /// so a burst of new connections shares one scan.
     pub fn lookup(&self, tcp: bool, local: SocketAddr) -> Option<PathBuf> {
+        let asked = Instant::now();
         let pid = {
             let mut t = if tcp { self.tcp.lock().unwrap() } else { self.udp.lock().unwrap() };
+            // Ports get reused by other apps: trust a hit only from a fresh table.
+            let fresh = t.scanned.is_some_and(|s| s.elapsed() < Duration::from_secs(1));
             match t.ports.get(&local.port()) {
-                Some(pid) => Some(*pid),
-                None if t.scanned.is_none_or(|s| s.elapsed() > RESCAN_AFTER) => {
+                Some(pid) if fresh => Some(*pid),
+                found if t.scanned.is_some_and(|s| s > asked) => found.copied(),
+                _ => {
                     t.ports = imp::scan(tcp);
                     t.scanned = Some(Instant::now());
                     t.ports.get(&local.port()).copied()
                 }
-                None => None,
             }
         }?;
         let mut paths = self.paths.lock().unwrap();
@@ -104,9 +111,24 @@ impl Finder {
         }
         let p = imp::exe_path(pid);
         debug!(pid, exe = ?p, port = local.port(), tcp, "flow owner");
+        // Once per process: what per-app routing decided for it.
+        if let Some(exe) = &p {
+            let direct = self.rules.as_ref().is_some_and(|r| r.is_direct(Some(exe)));
+            info!(pid, exe = %exe.display(), "app {}", if direct { "→ direct" } else { "→ proxy" });
+        }
         paths.insert(pid, (p.clone(), Instant::now()));
         p
     }
+}
+
+/// Port → pid of every socket of one protocol (diagnostics).
+pub fn scan_table(tcp: bool) -> HashMap<u16, u32> {
+    imp::scan(tcp)
+}
+
+/// Executable of a process (diagnostics).
+pub fn exe_path(pid: u32) -> Option<PathBuf> {
+    imp::exe_path(pid)
 }
 
 /// Decides per flow; shared by the TCP and UDP stacks.
@@ -117,7 +139,8 @@ pub struct AppRouter {
 
 impl AppRouter {
     pub fn new(rules: AppRules) -> Arc<Self> {
-        Arc::new(Self { rules, finder: Finder::default() })
+        let finder = Finder { rules: Some(rules.clone()), ..Default::default() };
+        Arc::new(Self { rules, finder })
     }
 
     /// `true` if the flow from the app socket `src` should go direct.
