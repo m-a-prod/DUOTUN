@@ -1,0 +1,8 @@
+/target
+/dist
+/run
+.DS_Store
+.idea/
+.vscode/
+*.swp
+packaging/windows/stage-*/
