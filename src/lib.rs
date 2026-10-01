@@ -3,6 +3,7 @@
 pub mod dns;
 pub mod nat;
 pub mod packet;
+pub mod process;
 pub mod socks5;
 pub mod sys;
 pub mod tcp;
@@ -21,6 +22,7 @@ use tun_rs::{AsyncDevice, DeviceBuilder};
 
 use crate::dns::Dns;
 use crate::nat::Nat;
+use crate::process::{AppRouter, AppRules};
 use crate::socks5::Socks5;
 use crate::tcp::{Endpoint, TcpStack};
 use crate::udp::{PacketSink, UdpStack};
@@ -46,6 +48,10 @@ pub struct Config {
     pub bypass: Vec<IpAddr>,
     /// Firewall port 53 outside the TUN (requires `auto_route`).
     pub strict_dns: bool,
+    /// Per-app routing: flows of matching apps go through `direct_socks`.
+    pub apps: Option<AppRules>,
+    /// SOCKS whose traffic leaves directly (an xray inbound routed to freedom).
+    pub direct_socks: Option<Socks5>,
 }
 
 impl Default for Config {
@@ -67,6 +73,8 @@ impl Default for Config {
             auto_route: true,
             bypass: vec![],
             strict_dns: true,
+            apps: None,
+            direct_socks: None,
         }
     }
 }
@@ -175,6 +183,16 @@ async fn serve(
     cancel: CancellationToken,
 ) -> Result<()> {
     let socks = Arc::new(cfg.socks.clone());
+    let routes = Arc::new(Routes {
+        proxy: socks.clone(),
+        apps: match (&cfg.apps, &cfg.direct_socks) {
+            (Some(rules), Some(direct)) => {
+                info!(mode = ?rules.mode, apps = ?rules.apps, "per-app routing");
+                Some((AppRouter::new(rules.clone()), Arc::new(direct.clone())))
+            }
+            _ => None,
+        },
+    });
     let nat = Arc::new(Nat::default());
     let tcp = TcpStack {
         nat: nat.clone(),
@@ -193,15 +211,15 @@ async fn serve(
         },
     };
     let sink = Arc::new(TunSink(dev.clone()));
-    let udp = UdpStack::new(sink.clone(), socks.clone(), cancel.clone());
+    let udp = UdpStack::new(sink.clone(), routes.clone(), cancel.clone());
     let dns = cfg
         .dns
         .map(|upstream| Dns::spawn(sink.clone(), socks.clone(), upstream, cancel.clone()));
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(tcp::serve(l4, nat.clone(), cfg.v4_peer.into(), socks.clone(), cfg.dns, cancel.clone()));
+    tasks.spawn(tcp::serve(l4, nat.clone(), cfg.v4_peer.into(), routes.clone(), cfg.dns, cancel.clone()));
     if let (Some(l), Some((_, peer))) = (l6, cfg.v6) {
-        tasks.spawn(tcp::serve(l, nat.clone(), peer.into(), socks.clone(), cfg.dns, cancel.clone()));
+        tasks.spawn(tcp::serve(l, nat.clone(), peer.into(), routes.clone(), cfg.dns, cancel.clone()));
     }
     {
         let nat = nat.clone();
@@ -250,6 +268,25 @@ async fn serve(
                 }
             }
         }
+    }
+}
+
+/// Which SOCKS a flow goes through.
+pub struct Routes {
+    pub proxy: Arc<Socks5>,
+    /// Per-app routing and the direct SOCKS.
+    pub apps: Option<(Arc<AppRouter>, Arc<Socks5>)>,
+}
+
+impl Routes {
+    /// The SOCKS for a new flow from the app socket `src`.
+    pub async fn pick(&self, src: SocketAddr, tcp: bool) -> &Arc<Socks5> {
+        if let Some((router, direct)) = &self.apps
+            && router.is_direct(src, tcp).await
+        {
+            return direct;
+        }
+        &self.proxy
     }
 }
 

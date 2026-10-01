@@ -37,6 +37,7 @@ app ──► TUN ──► duotun ──NAT──► kernel TCP ──► liste
 | Auto route | `route` | `route` / `netsh` | `ip route` |
 | DNS pinning | `networksetup`, all services | resolver on the TUN adapter | `resolvectl` / `resolv.conf` |
 | Strict DNS leak block | pf anchor | Windows Firewall rule | nftables (if installed) |
+| Per-app routing (`--app`) | libproc | IP Helper tables | `/proc` |
 | Network change handling | TODO | TODO | TODO |
 
 Used as a library by [DUORAY](../Duoray) (`duotun::run_notify`), or standalone:

@@ -14,7 +14,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Bring the TUN up and route traffic through the proxy.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Revert routes/DNS left behind by a crashed run.
     Cleanup,
 }
@@ -50,6 +50,21 @@ struct RunArgs {
     /// Only create the TUN; leave routes and DNS alone.
     #[arg(long)]
     no_auto_route: bool,
+    /// App (executable name, macOS app name or path) for per-app routing. Repeatable.
+    #[arg(long = "app", requires = "direct_socks")]
+    apps: Vec<String>,
+    /// `bypass`: the --app apps go direct; `only`: only they use the proxy.
+    #[arg(long, value_enum, default_value = "bypass")]
+    app_mode: AppModeArg,
+    /// SOCKS5 that sends traffic direct (same credentials as --socks).
+    #[arg(long)]
+    direct_socks: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AppModeArg {
+    Bypass,
+    Only,
 }
 
 fn main() -> Result<()> {
@@ -67,7 +82,7 @@ fn main() -> Result<()> {
             duotun::sys::recover();
             Ok(())
         }
-        Cmd::Run(a) => rt.block_on(run(a)),
+        Cmd::Run(a) => rt.block_on(run(*a)),
     }
 }
 
@@ -85,6 +100,14 @@ async fn run(a: RunArgs) -> Result<()> {
         strict_dns: !a.no_strict_dns,
         ..Default::default()
     };
+    if let Some(direct) = a.direct_socks {
+        cfg.direct_socks = Some(Socks5 { server: direct, auth: cfg.socks.auth.clone() });
+        let mode = match a.app_mode {
+            AppModeArg::Bypass => duotun::process::AppMode::Bypass,
+            AppModeArg::Only => duotun::process::AppMode::Only,
+        };
+        cfg.apps = Some(duotun::process::AppRules { mode, apps: a.apps });
+    }
     if a.no_ipv6 {
         cfg.v6 = None;
     }

@@ -11,6 +11,7 @@ use tracing::{debug, trace, warn};
 
 use crate::nat::Nat;
 use crate::packet::{self, Parsed};
+use crate::Routes;
 use crate::socks5::Socks5;
 
 /// Local listener for one address family.
@@ -77,7 +78,7 @@ pub async fn serve(
     listener: TcpListener,
     nat: Arc<Nat>,
     peer: IpAddr,
-    socks: Arc<Socks5>,
+    routes: Arc<Routes>,
     dns: Option<SocketAddr>,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
@@ -92,16 +93,18 @@ pub async fn serve(
             debug!(port, "accepted connection without nat entry");
             continue;
         };
-        let target = match dns {
-            Some(upstream) if flow.dst.port() == 53 => upstream,
-            _ => flow.dst,
+        let (target, is_dns) = match dns {
+            Some(upstream) if flow.dst.port() == 53 => (upstream, true),
+            _ => (flow.dst, false),
         };
         let nat = nat.clone();
-        let socks = socks.clone();
+        let routes = routes.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
+            // DNS always goes through the proxy, whichever app asks.
+            let socks = if is_dns { &routes.proxy } else { routes.pick(flow.src, true).await };
             tokio::select! {
-                r = relay(stream, target, &socks) => {
+                r = relay(stream, target, socks) => {
                     if let Err(e) = r {
                         debug!(src = %flow.src, dst = %target, "tcp relay ended: {e}");
                     }

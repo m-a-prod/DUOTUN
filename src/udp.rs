@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use crate::packet;
-use crate::socks5::{self, Socks5};
+use crate::Routes;
+use crate::socks5;
 
 const QUEUE: usize = 256;
 const IDLE: Duration = Duration::from_secs(60);
@@ -26,7 +27,7 @@ pub trait PacketSink: Send + Sync + 'static {
 
 pub struct UdpStack<S: PacketSink> {
     sink: Arc<S>,
-    socks: Arc<Socks5>,
+    routes: Arc<Routes>,
     cancel: CancellationToken,
     sessions: Mutex<HashMap<SocketAddr, Session>>,
     next_id: AtomicU64,
@@ -38,10 +39,10 @@ struct Session {
 }
 
 impl<S: PacketSink> UdpStack<S> {
-    pub fn new(sink: Arc<S>, socks: Arc<Socks5>, cancel: CancellationToken) -> Arc<Self> {
+    pub fn new(sink: Arc<S>, routes: Arc<Routes>, cancel: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             sink,
-            socks,
+            routes,
             cancel,
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -90,7 +91,8 @@ impl<S: PacketSink> UdpStack<S> {
         app: SocketAddr,
         mut rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     ) -> std::io::Result<()> {
-        let socks5::UdpAssociation { mut ctrl, socket } = self.socks.udp_associate().await?;
+        let socks = self.routes.pick(app, false).await;
+        let socks5::UdpAssociation { mut ctrl, socket } = socks.udp_associate().await?;
         trace!(%app, "udp association open");
 
         let mut buf = vec![0u8; 65536];
