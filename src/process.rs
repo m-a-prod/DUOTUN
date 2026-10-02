@@ -2,8 +2,8 @@
 //! decides whether it goes through the proxy or the direct SOCKS.
 //!
 //! The lookup goes by the app socket's local port: a table of port → pid is
-//! built from the OS socket list and rebuilt on a miss (rate limited), so a
-//! burst of new connections costs one scan.
+//! built from the OS socket list and rebuilt on a miss. Concurrent lookups
+//! may share a scan only if it started after their lookup began.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -65,7 +65,21 @@ impl AppRules {
 #[derive(Default)]
 struct Table {
     ports: HashMap<u16, u32>,
+    /// Scan start, not completion: sockets created during a scan can be missed.
     scanned: Option<Instant>,
+}
+
+impl Table {
+    fn owner(&mut self, port: u16, asked: Instant, scan: impl FnOnce() -> HashMap<u16, u32>) -> Option<u32> {
+        let found = self.ports.get(&port).copied();
+        let fresh = self.scanned.is_some_and(|s| s.elapsed() < Duration::from_secs(1));
+        if (found.is_some() && fresh) || self.scanned.is_some_and(|s| s > asked) {
+            return found;
+        }
+        self.scanned = Some(Instant::now());
+        self.ports = scan();
+        self.ports.get(&port).copied()
+    }
 }
 
 #[derive(Default)]
@@ -88,17 +102,7 @@ impl Finder {
         let asked = Instant::now();
         let pid = {
             let mut t = if tcp { self.tcp.lock().unwrap() } else { self.udp.lock().unwrap() };
-            // Ports get reused by other apps: trust a hit only from a fresh table.
-            let fresh = t.scanned.is_some_and(|s| s.elapsed() < Duration::from_secs(1));
-            match t.ports.get(&local.port()) {
-                Some(pid) if fresh => Some(*pid),
-                found if t.scanned.is_some_and(|s| s > asked) => found.copied(),
-                _ => {
-                    t.ports = imp::scan(tcp);
-                    t.scanned = Some(Instant::now());
-                    t.ports.get(&local.port()).copied()
-                }
-            }
+            t.owner(local.port(), asked, || imp::scan(tcp))
         }?;
         let mut paths = self.paths.lock().unwrap();
         if let Some((p, at)) = paths.get(&pid)
@@ -116,7 +120,10 @@ impl Finder {
             let direct = self.rules.as_ref().is_some_and(|r| r.is_direct(Some(exe)));
             info!(pid, exe = %exe.display(), "app {}", if direct { "→ direct" } else { "→ proxy" });
         }
-        paths.insert(pid, (p.clone(), Instant::now()));
+        // A transient proc_pidpath failure must not proxy this PID for a minute.
+        if p.is_some() {
+            paths.insert(pid, (p.clone(), Instant::now()));
+        }
         p
     }
 }
@@ -147,7 +154,9 @@ impl AppRouter {
     pub async fn is_direct(self: &Arc<Self>, src: SocketAddr, tcp: bool) -> bool {
         let this = self.clone();
         let exe = tokio::task::spawn_blocking(move || this.finder.lookup(tcp, src)).await.ok().flatten();
-        self.rules.is_direct(exe.as_deref())
+        let direct = self.rules.is_direct(exe.as_deref());
+        debug!(%src, tcp, exe = ?exe, direct, "per-app flow decision");
+        direct
     }
 }
 
@@ -383,6 +392,31 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn miss_during_scan_is_rescanned() {
+        let mut table = Table::default();
+        let mut asked_during_scan = None;
+        assert_eq!(
+            table.owner(1000, Instant::now(), || {
+                asked_during_scan = Some(Instant::now());
+                HashMap::from([(1000, 10)])
+            }),
+            Some(10)
+        );
+        assert_eq!(
+            table.owner(2000, asked_during_scan.unwrap(), || HashMap::from([(2000, 20)])),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn miss_shares_scan_started_after_lookup() {
+        let mut table = Table::default();
+        let asked = Instant::now() - Duration::from_millis(1);
+        table.owner(1000, Instant::now(), || HashMap::from([(1000, 10)]));
+        assert_eq!(table.owner(2000, asked, || panic!("scan already covered this lookup")), None);
+    }
 
     #[test]
     fn matching() {
