@@ -22,6 +22,14 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
         v4.gateway.as_deref().unwrap_or("link")
     );
 
+    // IP_BOUND_IF (xray's sockopt.interface) needs a scoped physical route.
+    // An unscoped default alone is not enough once the TUN /1 routes win:
+    // bound direct connections can fail with ENETUNREACH instead of using it.
+    ensure_scoped_default(false, &v4, log)?;
+    if let Some(v6) = &v6 {
+        ensure_scoped_default(true, v6, log)?;
+    }
+
     // 1. Proxy servers keep using the physical uplink; must precede the split routes.
     for ip in &cfg.bypass {
         let route = match ip {
@@ -111,6 +119,42 @@ fn default_route(v6: bool) -> Result<DefaultRoute> {
     })
 }
 
+fn has_scoped_default(output: &str, iface: &str) -> bool {
+    let scoped = output.lines().any(|line| {
+        line.trim().strip_prefix("flags:").is_some_and(|flags| {
+            flags.trim().trim_matches(['<', '>']).split(',').any(|flag| flag.trim() == "IFSCOPE")
+        })
+    });
+    let same_interface = output.lines().any(|line| {
+        line.trim().strip_prefix("interface:").is_some_and(|value| value.trim() == iface)
+    });
+    scoped && same_interface
+}
+
+/// Retain an existing scoped default; record only the route we need to add.
+fn ensure_scoped_default(v6: bool, via: &DefaultRoute, log: &mut UndoLog) -> Result<()> {
+    let family = if v6 { "-inet6" } else { "-inet" };
+    let current = run(&["/sbin/route", "-n", "get", family, "-ifscope", &via.iface, "default"])
+        .unwrap_or_default();
+    if has_scoped_default(&current, &via.iface) {
+        return Ok(());
+    }
+
+    log.push_cmd(&["/sbin/route", "-n", "delete", family, "default", "-ifscope", &via.iface])?;
+    let mut add = vec!["/sbin/route", "-n", "add", family, "default"];
+    match &via.gateway {
+        Some(gateway) => add.push(gateway),
+        None => add.extend(["-interface", via.iface.as_str()]),
+    }
+    add.extend(["-ifscope", via.iface.as_str()]);
+    // Best effort: without it only direct (bypassing) traffic breaks, the tunnel still works.
+    match run(&add) {
+        Ok(_) => info!(iface = %via.iface, ipv6 = v6, "scoped uplink route ready for direct connections"),
+        Err(e) => warn!(iface = %via.iface, ipv6 = v6, "no scoped uplink route, direct connections may fail: {e}"),
+    }
+    Ok(())
+}
+
 fn add_host_route(ip: IpAddr, via: &DefaultRoute, log: &mut UndoLog) -> Result<()> {
     let ip_s = ip.to_string();
     let family = if ip.is_ipv6() { "-inet6" } else { "-inet" };
@@ -161,4 +205,22 @@ fn set_dns(server: &str, log: &mut UndoLog) -> Result<()> {
 fn flush_dns_cache() {
     let _ = run(&["/usr/bin/dscacheutil", "-flushcache"]);
     let _ = run(&["/usr/bin/killall", "-HUP", "mDNSResponder"]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unscoped_default_is_not_enough_for_bound_connections() {
+        let output = "destination: default\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,GLOBAL>\n";
+        assert!(!has_scoped_default(output, "en0"));
+    }
+
+    #[test]
+    fn existing_scoped_default_must_belong_to_the_uplink() {
+        let output = "destination: default\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,IFSCOPE>\n";
+        assert!(has_scoped_default(output, "en0"));
+        assert!(!has_scoped_default(output, "en1"));
+    }
 }
