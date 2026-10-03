@@ -11,7 +11,7 @@ pub mod udp;
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -139,22 +139,20 @@ pub async fn run_notify(
         warn!("no --bypass given: xray's connection to its server will loop into the TUN");
     }
 
-    let mut undo = if cfg.auto_route {
-        Some(sys::apply(&sys::SysConfig {
-            tun_name: tun_name.clone(),
-            dns: cfg.v4_peer,
-            ipv6: cfg.v6.map(|(a, _)| a),
-            bypass,
-            strict_dns: cfg.strict_dns,
-        })?)
-    } else {
-        None
+    let sys_cfg = sys::SysConfig {
+        tun_name: tun_name.clone(),
+        dns: cfg.v4_peer,
+        ipv6: cfg.v6.map(|(a, _)| a),
+        bypass,
+        strict_dns: cfg.strict_dns,
     };
+    let undo = if cfg.auto_route { Some(Arc::new(Mutex::new(sys::apply(&sys_cfg)?))) } else { None };
 
     ready(tun_name.clone());
     let cancel = CancellationToken::new();
     let result = tokio::select! {
         r = serve(&cfg, dev.clone(), l4, l6, cancel.clone()) => r,
+        _ = follow_network(&sys_cfg, undo.clone()) => Ok(()),
         _ = shutdown => {
             info!("shutting down");
             Ok(())
@@ -168,11 +166,27 @@ pub async fn run_notify(
 
     // Revert while the TUN still exists: routes can be deleted cleanly and DNS
     // never points at a dead address.
-    if let Some(log) = undo.as_mut() {
-        log.revert();
+    if let Some(log) = undo {
+        log.lock().unwrap().revert();
     }
     drop(dev);
     result
+}
+
+/// Keeps routes in line with the uplink while the tunnel is up. Never returns.
+async fn follow_network(cfg: &sys::SysConfig, undo: Option<Arc<Mutex<sys::UndoLog>>>) {
+    // Only Linux follows the uplink so far; elsewhere this just waits.
+    let Some(undo) = undo.filter(|_| cfg!(target_os = "linux")) else { return std::future::pending().await };
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let (cfg, undo) = (cfg.clone(), undo.clone());
+        let r = tokio::task::spawn_blocking(move || sys::refresh(&cfg, &mut undo.lock().unwrap())).await;
+        if let Ok(Err(e)) = r {
+            warn!("network refresh failed: {e:#}");
+        }
+    }
 }
 
 async fn serve(

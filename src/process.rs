@@ -54,12 +54,28 @@ impl AppRules {
     /// `true` if a flow of this executable (or of an unknown one) goes direct.
     /// Unknown processes always use the proxy: never leak by mistake.
     pub fn is_direct(&self, exe: Option<&Path>) -> bool {
-        match (self.mode, exe) {
-            (_, None) => false,
-            (AppMode::Bypass, Some(e)) => self.matches(e),
-            (AppMode::Only, Some(e)) => !self.matches(e),
+        self.is_direct_owner(exe.map(|e| Owner { exe: e.to_path_buf(), argv0: None }).as_ref())
+    }
+
+    /// Like [`Self::is_direct`]; the process also matches by its `argv[0]`.
+    pub fn is_direct_owner(&self, owner: Option<&Owner>) -> bool {
+        let Some(o) = owner else { return false };
+        let matched = self.matches(&o.exe) || o.argv0.as_deref().is_some_and(|a| self.matches(a));
+        match self.mode {
+            AppMode::Bypass => matched,
+            AppMode::Only => !matched,
         }
     }
+}
+
+/// The process behind a flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    pub exe: PathBuf,
+    /// Linux: the name the program was started as, when it differs from the
+    /// executable. Apps run by a shared runtime (Electron, Python, a JVM) are
+    /// only recognizable by it: Discord's executable is /usr/lib/electron*/electron.
+    pub argv0: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -88,7 +104,7 @@ pub struct Finder {
     rules: Option<AppRules>,
     tcp: Mutex<Table>,
     udp: Mutex<Table>,
-    paths: Mutex<HashMap<u32, (Option<PathBuf>, Instant)>>,
+    paths: Mutex<HashMap<u32, (Option<Owner>, Instant)>>,
 }
 
 impl Finder {
@@ -99,6 +115,11 @@ impl Finder {
     /// a second scan would not find it either). Lookups queue on the lock,
     /// so a burst of new connections shares one scan.
     pub fn lookup(&self, tcp: bool, local: SocketAddr) -> Option<PathBuf> {
+        self.lookup_owner(tcp, local).map(|o| o.exe)
+    }
+
+    /// Like [`Self::lookup`], with the process's `argv[0]` (Linux).
+    pub fn lookup_owner(&self, tcp: bool, local: SocketAddr) -> Option<Owner> {
         let asked = Instant::now();
         let pid = {
             let mut t = if tcp { self.tcp.lock().unwrap() } else { self.udp.lock().unwrap() };
@@ -113,12 +134,15 @@ impl Finder {
         if paths.len() > 4096 {
             paths.clear();
         }
-        let p = imp::exe_path(pid);
-        debug!(pid, exe = ?p, port = local.port(), tcp, "flow owner");
+        let p = imp::exe_path(pid).map(|exe| Owner { argv0: imp::argv0(pid, &exe), exe });
+        debug!(pid, owner = ?p, port = local.port(), tcp, "flow owner");
         // Once per process: what per-app routing decided for it.
-        if let Some(exe) = &p {
-            let direct = self.rules.as_ref().is_some_and(|r| r.is_direct(Some(exe)));
-            info!(pid, exe = %exe.display(), "app {}", if direct { "→ direct" } else { "→ proxy" });
+        if let Some(o) = &p {
+            let direct = self.rules.as_ref().is_some_and(|r| r.is_direct_owner(Some(o)));
+            match &o.argv0 {
+                Some(a) => info!(pid, exe = %o.exe.display(), argv0 = %a.display(), "app {}", if direct { "→ direct" } else { "→ proxy" }),
+                None => info!(pid, exe = %o.exe.display(), "app {}", if direct { "→ direct" } else { "→ proxy" }),
+            }
         }
         // A transient proc_pidpath failure must not proxy this PID for a minute.
         if p.is_some() {
@@ -153,9 +177,9 @@ impl AppRouter {
     /// `true` if the flow from the app socket `src` should go direct.
     pub async fn is_direct(self: &Arc<Self>, src: SocketAddr, tcp: bool) -> bool {
         let this = self.clone();
-        let exe = tokio::task::spawn_blocking(move || this.finder.lookup(tcp, src)).await.ok().flatten();
-        let direct = self.rules.is_direct(exe.as_deref());
-        debug!(%src, tcp, exe = ?exe, direct, "per-app flow decision");
+        let owner = tokio::task::spawn_blocking(move || this.finder.lookup_owner(tcp, src)).await.ok().flatten();
+        let direct = self.rules.is_direct_owner(owner.as_ref());
+        debug!(%src, tcp, owner = ?owner, direct, "per-app flow decision");
         direct
     }
 }
@@ -244,6 +268,10 @@ mod imp {
         out
     }
 
+    pub fn argv0(_pid: u32, _exe: &std::path::Path) -> Option<PathBuf> {
+        None
+    }
+
     pub fn exe_path(pid: u32) -> Option<PathBuf> {
         let mut buf = vec![0u8; 4096];
         // SAFETY: buffer of the size passed.
@@ -298,6 +326,14 @@ mod imp {
 
     pub fn exe_path(pid: u32) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+
+    /// `argv[0]` when its file name differs from the executable's.
+    pub fn argv0(pid: u32, exe: &std::path::Path) -> Option<PathBuf> {
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let first = cmdline.split(|b| *b == 0).next().filter(|a| !a.is_empty())?;
+        let argv0 = PathBuf::from(String::from_utf8_lossy(first).into_owned());
+        (argv0.file_name() != exe.file_name()).then_some(argv0)
     }
 }
 
@@ -373,6 +409,10 @@ mod imp {
         out
     }
 
+    pub fn argv0(_pid: u32, _exe: &std::path::Path) -> Option<PathBuf> {
+        None
+    }
+
     pub fn exe_path(pid: u32) -> Option<PathBuf> {
         // SAFETY: handle checked and closed; buffer of the size passed.
         unsafe {
@@ -435,6 +475,12 @@ mod tests {
         assert!(!only.is_direct(Some(Path::new("/opt/steam/steam"))));
         assert!(only.is_direct(Some(Path::new("/usr/bin/wget"))));
         assert!(!only.is_direct(None));
+
+        let discord = Owner { exe: "/usr/lib/electron36/electron".into(), argv0: Some("/usr/lib/discord/Discord".into()) };
+        let r = AppRules { mode: AppMode::Bypass, apps: vec!["discord".into()] };
+        assert!(r.is_direct_owner(Some(&discord)), "Electron app matched by argv[0]");
+        let r = AppRules { mode: AppMode::Bypass, apps: vec!["electron".into()] };
+        assert!(r.is_direct_owner(Some(&discord)), "and by its executable");
     }
 
     /// Our own sockets must be found with our own executable.

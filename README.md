@@ -33,12 +33,13 @@ app ──► TUN ──► duotun ──NAT──► kernel TCP ──► liste
 
 | | macOS | Windows | Linux |
 |---|---|---|---|
-| TUN + TCP/UDP/DNS | tested | tested (Wintun, x64 + x86) | compiles, untested |
-| Auto route | `route` | `route` / `netsh` | `ip route` |
-| DNS pinning | `networksetup`, all services | resolver on the TUN adapter | `resolvectl` / `resolv.conf` |
-| Strict DNS leak block | pf anchor | Windows Firewall rule | nftables (if installed) |
-| Per-app routing (`--app`) | libproc | IP Helper tables | `/proc` |
-| Network change handling | TODO | TODO | TODO |
+| TUN + TCP/UDP/DNS | tested | tested (Wintun, x64 + x86) | tested |
+| Auto route | `route` | `route` / `netsh` | `ip route`, loose `rp_filter` on the uplink |
+| DNS pinning | `networksetup`, all services | resolver on the TUN adapter | `resolvectl` (if it serves resolv.conf) + DNAT of every port-53 query into the TUN |
+| Strict DNS leak block | pf anchor | Windows Firewall rule | nftables, else iptables |
+| Host firewall | — | — | TUN allowed in INPUT (iptables/ufw, firewalld, nftables) |
+| Per-app routing (`--app`) | libproc | IP Helper tables | `/proc` (exe and `argv[0]`) |
+| Network change handling | TODO | TODO | bypass routes follow the uplink |
 
 Used as a library by [DUORAY](../Duoray) (`duotun::run_notify`), or standalone:
 

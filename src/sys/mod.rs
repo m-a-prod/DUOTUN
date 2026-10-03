@@ -63,6 +63,18 @@ pub fn apply(cfg: &SysConfig) -> Result<UndoLog> {
     Ok(log)
 }
 
+/// Re-applies what depends on the uplink after the network changed.
+/// Cheap when nothing changed; meant to be called every few seconds.
+pub fn refresh(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return imp::refresh(cfg, log);
+    #[allow(unreachable_code)]
+    {
+        let _ = (cfg, log);
+        Ok(())
+    }
+}
+
 /// Reverts changes left behind by a previous run that did not exit cleanly.
 pub fn recover() {
     let path = state_path();
@@ -80,6 +92,8 @@ pub fn recover() {
 pub enum Undo {
     Cmd(Vec<String>),
     WriteFile { path: PathBuf, content: String },
+    /// Put a symlink back (e.g. /etc/resolv.conf managed by another tool).
+    Symlink { path: PathBuf, target: PathBuf },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,12 +159,24 @@ impl UndoLog {
                         }
                     }
                 }
+                // A per-interface sysctl of an interface that is gone: nothing to restore.
+                Undo::WriteFile { path, .. } if path.starts_with("/proc") && !path.exists() => {}
                 Undo::WriteFile { path, content } => {
                     if let Err(e) = std::fs::write(path, content) {
                         warn!("failed to restore {}: {e}", path.display());
                         retry.push(step);
                     }
                 }
+                #[cfg(unix)]
+                Undo::Symlink { path, target } => {
+                    let _ = std::fs::remove_file(path);
+                    if let Err(e) = std::os::unix::fs::symlink(target, path) {
+                        warn!("failed to restore {} -> {}: {e}", path.display(), target.display());
+                        retry.push(step);
+                    }
+                }
+                #[cfg(not(unix))]
+                Undo::Symlink { .. } => {}
             }
         }
         if retry.is_empty() {
