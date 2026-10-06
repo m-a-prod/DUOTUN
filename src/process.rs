@@ -337,6 +337,47 @@ mod imp {
     }
 }
 
+/// Where the fields sit in one row of a Windows IP Helper owner table.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct RowLayout {
+    size: usize,
+    port: usize,
+    pid: usize,
+    /// TCP only: MIB_TCP_STATE.
+    state: Option<usize>,
+}
+
+/// MIB_TCP_STATE_TIME_WAIT: a closed connection lingering on its port.
+#[cfg_attr(not(windows), allow(dead_code))]
+const TCP_TIME_WAIT: u32 = 11;
+
+/// Adds the (local port → pid) rows of an IP Helper table (a u32 count, then
+/// fixed-size rows). Rows without an owner (pid 0) and TIME_WAIT leftovers are
+/// skipped: a port is reused while its old connection still lingers, and the
+/// leftover must not hide the process that owns the port now (its flows
+/// would go to the proxy as "unknown").
+#[cfg_attr(not(windows), allow(dead_code))]
+fn read_rows(buf: &[u8], layout: RowLayout, out: &mut HashMap<u16, u32>) {
+    let u32_at = |off: usize| u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
+    if buf.len() < 4 {
+        return;
+    }
+    let n = u32_at(0) as usize;
+    for i in 0..n {
+        let base = 4 + i * layout.size;
+        if base + layout.size > buf.len() {
+            break;
+        }
+        let port = u16::from_be(u32_at(base + layout.port) as u16);
+        let pid = u32_at(base + layout.pid);
+        let lingering = layout.state.is_some_and(|s| u32_at(base + s) == TCP_TIME_WAIT);
+        if port != 0 && pid != 0 && !lingering {
+            out.insert(port, pid);
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     //! IP Helper tables with owning pids.
@@ -377,34 +418,17 @@ mod imp {
 
     pub fn scan(tcp: bool) -> HashMap<u16, u32> {
         let mut out = HashMap::new();
-        // (family, row size, local port offset, pid offset)
-        let layouts: [(u16, usize, usize, usize); 2] = if tcp {
+        let layouts = if tcp {
             // MIB_TCPROW_OWNER_PID: state, laddr, lport, raddr, rport, pid
             // MIB_TCP6ROW_OWNER_PID: laddr[16], lscope, lport, raddr[16], rscope, rport, state, pid
-            [(AF_INET, 24, 8, 20), (AF_INET6, 56, 20, 52)]
+            [(AF_INET, super::RowLayout { size: 24, port: 8, pid: 20, state: Some(0) }), (AF_INET6, super::RowLayout { size: 56, port: 20, pid: 52, state: Some(48) })]
         } else {
             // MIB_UDPROW_OWNER_PID: laddr, lport, pid
             // MIB_UDP6ROW_OWNER_PID: laddr[16], lscope, lport, pid
-            [(AF_INET, 12, 4, 8), (AF_INET6, 28, 20, 24)]
+            [(AF_INET, super::RowLayout { size: 12, port: 4, pid: 8, state: None }), (AF_INET6, super::RowLayout { size: 28, port: 20, pid: 24, state: None })]
         };
-        for (family, row, port_off, pid_off) in layouts {
-            let buf = table(tcp, family);
-            if buf.len() < 4 {
-                continue;
-            }
-            let n = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
-            for i in 0..n {
-                let base = 4 + i * row;
-                if base + row > buf.len() {
-                    break;
-                }
-                let raw = u32::from_ne_bytes(buf[base + port_off..base + port_off + 4].try_into().unwrap());
-                let port = u16::from_be(raw as u16);
-                let pid = u32::from_ne_bytes(buf[base + pid_off..base + pid_off + 4].try_into().unwrap());
-                if port != 0 {
-                    out.insert(port, pid);
-                }
-            }
+        for (family, layout) in layouts {
+            super::read_rows(&table(tcp, family), layout, &mut out);
         }
         out
     }
@@ -432,6 +456,25 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lingering_rows_do_not_hide_the_owner() {
+        // MIB_TCPROW_OWNER_PID rows: state, laddr, lport (network order), raddr, rport, pid.
+        let row = |state: u32, port: u16, pid: u32| {
+            [state, 0, u32::from(port.to_be()), 0, 0, pid].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>()
+        };
+        let mut buf = 3u32.to_ne_bytes().to_vec();
+        buf.extend(row(5, 50000, 4242)); // ESTABLISHED, the real owner
+        buf.extend(row(TCP_TIME_WAIT, 50000, 0)); // the port's previous connection
+        buf.extend(row(5, 50001, 0)); // no owner
+        let mut out = HashMap::new();
+        read_rows(&buf, RowLayout { size: 24, port: 8, pid: 20, state: Some(0) }, &mut out);
+        assert_eq!(out, HashMap::from([(50000, 4242)]));
+        // A truncated table is read up to its last whole row.
+        let mut out = HashMap::new();
+        read_rows(&buf[..4 + 24 + 10], RowLayout { size: 24, port: 8, pid: 20, state: Some(0) }, &mut out);
+        assert_eq!(out, HashMap::from([(50000, 4242)]));
+    }
 
     #[test]
     fn miss_during_scan_is_rescanned() {
