@@ -205,7 +205,11 @@ mod listener_tests {
     fn per_accept_errors_are_retried() {
         use std::io::{Error, ErrorKind};
         assert!(accept_error_is_transient(&Error::from(ErrorKind::ConnectionAborted)));
-        assert!(accept_error_is_transient(&Error::from_raw_os_error(libc::EMFILE)));
-        assert!(!accept_error_is_transient(&Error::from_raw_os_error(libc::EINVAL)));
+        assert!(!accept_error_is_transient(&Error::from(ErrorKind::InvalidInput)));
+        #[cfg(unix)]
+        {
+            assert!(accept_error_is_transient(&Error::from_raw_os_error(libc::EMFILE)));
+            assert!(!accept_error_is_transient(&Error::from_raw_os_error(libc::EINVAL)));
+        }
     }
 }

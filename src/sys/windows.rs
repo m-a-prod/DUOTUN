@@ -26,16 +26,11 @@ struct DefaultRoute {
     alias: String,
 }
 
-fn ps(script: &str) -> Result<String> {
-    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; {script}");
-    Ok(run(&["powershell", "-NoProfile", "-NonInteractive", "-Command", &script])?)
-}
-
 pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     let tun = cfg.tun_name.as_str();
     let tun_index = adapter_index(tun)?;
-    let v4 = default_route(false, tun).context("no IPv4 default route")?;
-    let v6 = default_route(true, tun).ok();
+    let v4 = default_route(false, tun_index).context("no IPv4 default route")?;
+    let v6 = default_route(true, tun_index).ok();
     info!("uplink: {} via {}", v4.alias, v4.gateway);
 
     // 1. Proxy servers keep using the physical uplink.
@@ -135,30 +130,77 @@ fn block_dns_outside_tun(dns: &str, log: &mut UndoLog) -> Result<()> {
     Ok(())
 }
 
+// The adapter and route lookups call the IP Helper API directly: each
+// PowerShell start used to cost about two seconds of the connect time.
+
 fn adapter_index(name: &str) -> Result<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    let alias: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // The adapter may take a moment to appear after Wintun creates it.
-    for _ in 0..20 {
-        if let Ok(out) = ps(&format!("(Get-NetAdapter -Name '{name}' -ErrorAction Stop).ifIndex"))
-            && let Ok(i) = out.trim().parse()
+    for _ in 0..40 {
+        let mut luid = NET_LUID_LH::default();
+        let mut index = 0;
+        // SAFETY: `alias` is NUL-terminated; both outputs are valid locals.
+        if unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } == 0
+            && unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) } == 0
         {
-            return Ok(i);
+            return Ok(index);
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     bail!("adapter {name} not found")
 }
 
-fn default_route(v6: bool, tun: &str) -> Result<DefaultRoute> {
-    let (family, prefix) = if v6 { ("IPv6", "::/0") } else { ("IPv4", "0.0.0.0/0") };
-    let out = ps(&format!(
-        "Get-NetRoute -AddressFamily {family} -DestinationPrefix '{prefix}' -ErrorAction Stop | \
-         Where-Object {{ $_.InterfaceAlias -ne '{tun}' }} | Sort-Object RouteMetric | \
-         Select-Object -First 1 NextHop,ifIndex,InterfaceAlias | ConvertTo-Json -Compress"
-    ))?;
-    let v: serde_json::Value = serde_json::from_str(out.trim()).context("parsing Get-NetRoute")?;
-    Ok(DefaultRoute {
-        gateway: v["NextHop"].as_str().context("no next hop")?.to_string(),
-        if_index: v["ifIndex"].as_u64().context("no ifIndex")? as u32,
-        alias: v["InterfaceAlias"].as_str().unwrap_or_default().to_string(),
-    })
+/// The default route Windows would use, ignoring the TUN: lowest route plus
+/// interface metric, as the stack itself picks it.
+fn default_route(v6: bool, tun_index: u32) -> Result<DefaultRoute> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_TABLE2,
+        MIB_IPINTERFACE_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: on success the table is ours until FreeMibTable.
+    let err = unsafe { GetIpForwardTable2(family, &mut table) };
+    if err != 0 {
+        bail!("GetIpForwardTable2: error {err}");
+    }
+    // SAFETY: the table holds NumEntries rows.
+    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
+    let mut best: Option<(u32, DefaultRoute)> = None;
+    for row in rows {
+        if row.DestinationPrefix.PrefixLength != 0 || row.InterfaceIndex == tun_index {
+            continue;
+        }
+        let mut iface = MIB_IPINTERFACE_ROW { Family: family, InterfaceLuid: row.InterfaceLuid, ..Default::default() };
+        // SAFETY: Family and InterfaceLuid identify the row to fill.
+        if unsafe { GetIpInterfaceEntry(&mut iface) } != 0 || !iface.Connected {
+            continue;
+        }
+        let metric = row.Metric.saturating_add(iface.Metric);
+        if best.as_ref().is_some_and(|(m, _)| *m <= metric) {
+            continue;
+        }
+        // SAFETY: the union member matches the table's address family.
+        let gateway = unsafe {
+            if v6 {
+                IpAddr::from(row.NextHop.Ipv6.sin6_addr.u.Byte).to_string()
+            } else {
+                IpAddr::from(row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes()).to_string()
+            }
+        };
+        let mut entry = MIB_IF_ROW2 { InterfaceLuid: row.InterfaceLuid, ..Default::default() };
+        // SAFETY: InterfaceLuid identifies the row to fill.
+        let alias = if unsafe { GetIfEntry2(&mut entry) } == 0 { wide(&entry.Alias) } else { String::new() };
+        best = Some((metric, DefaultRoute { gateway, if_index: row.InterfaceIndex, alias }));
+    }
+    // SAFETY: allocated by GetIpForwardTable2 above.
+    unsafe { FreeMibTable(table.cast()) };
+    best.map(|(_, r)| r).context("no default route")
+}
+
+fn wide(s: &[u16]) -> String {
+    String::from_utf16_lossy(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())])
 }
