@@ -107,11 +107,20 @@ pub async fn run_notify(
         sys::recover();
     }
 
-    let mut builder = DeviceBuilder::new()
-        .mtu(cfg.mtu)
-        // On Windows tun-rs turns the peer into a default-route gateway; our own
-        // split routes are installed later, so give it no peer there.
-        .ipv4(cfg.v4, 30, (!cfg!(windows)).then_some(cfg.v4_peer));
+    #[cfg(windows)]
+    let mut cfg = cfg;
+    let builder = DeviceBuilder::new();
+    // On Windows `.mtu()` also sets the IPv6 MTU, and that fails with "Element
+    // not found" (os error 1168) when IPv6 is turned off on the machine: the
+    // whole adapter failed. IPv6 is set up below, after the adapter exists.
+    #[cfg(windows)]
+    let builder = builder.mtu_v4(cfg.mtu);
+    #[cfg(not(windows))]
+    let builder = builder.mtu(cfg.mtu);
+    // On Windows tun-rs turns the peer into a default-route gateway; our own
+    // split routes are installed later, so give it no peer there.
+    let mut builder = builder.ipv4(cfg.v4, 30, (!cfg!(windows)).then_some(cfg.v4_peer));
+    #[cfg(not(windows))]
     if let Some((v6, _)) = cfg.v6 {
         builder = builder.ipv6(v6, 126);
     }
@@ -119,6 +128,14 @@ pub async fn run_notify(
         builder = builder.name(name);
     }
     let dev = Arc::new(builder.build_async().context("creating TUN device (root required)")?);
+    // IPv6 off on this machine: tunnel IPv4 only (there is no IPv6 to leak).
+    #[cfg(windows)]
+    if let Some((v6, _)) = cfg.v6
+        && let Err(e) = dev.set_mtu_v6(cfg.mtu).and_then(|()| dev.add_address_v6(v6, 126))
+    {
+        warn!("no IPv6 on the TUN ({e}); IPv4 only");
+        cfg.v6 = None;
+    }
     let tun_name = dev.name()?;
     #[cfg(windows)]
     sys::skip_dad(&tun_name);
