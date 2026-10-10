@@ -11,6 +11,7 @@ use super::{SysConfig, UndoLog, run};
 
 const FW_RULE: &str = "DUORAY DNS guard";
 const FW_INBOUND: &str = "DUORAY TUN";
+const FW_IPV6: &str = "DUORAY IPv6 guard";
 
 /// Turns off duplicate address detection on the new adapter so its addresses
 /// become usable at once (WireGuard does the same). Best effort.
@@ -73,6 +74,8 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
             log.push_cmd(&["netsh", "interface", "ipv6", "delete", "route", net, &tun_idx])?;
             run(&["netsh", "interface", "ipv6", "add", "route", net, &tun_idx, "store=active"])?;
         }
+    } else if v6.is_some() {
+        block_ipv6_outside_tun(cfg, log)?;
     }
 
     // 3. The TUN's resolver, preferred over every other adapter.
@@ -100,6 +103,26 @@ fn allow_inbound_on_tun(log: &mut UndoLog) -> Result<()> {
         &format!("program={exe}"), "enable=yes",
     ]) {
         warn!("could not add the inbound firewall rule: {e}");
+    }
+    Ok(())
+}
+
+/// The TUN has no IPv6 (it could not be set up on it) but the uplink has:
+/// IPv6 would bypass the tunnel. Blocks it to the internet (2000::/3, the
+/// LAN keeps working) so apps fall back to IPv4, which goes through the TUN.
+/// Not when a proxy server is IPv6-only reachable: block rules win over the
+/// bypass route, and the tunnel itself would break.
+fn block_ipv6_outside_tun(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    if cfg.bypass.iter().any(IpAddr::is_ipv6) {
+        warn!("no IPv6 on the TUN and an IPv6 proxy server: IPv6 is NOT guarded");
+        return Ok(());
+    }
+    let name = format!("name={FW_IPV6}");
+    let _ = run(&["netsh", "advfirewall", "firewall", "delete", "rule", &name]);
+    log.push_cmd(&["netsh", "advfirewall", "firewall", "delete", "rule", &name])?;
+    match run(&["netsh", "advfirewall", "firewall", "add", "rule", &name, "dir=out", "action=block", "remoteip=2000::/3"]) {
+        Ok(_) => info!("no IPv6 on the TUN: internet IPv6 blocked (Windows Firewall)"),
+        Err(e) => warn!("firewall rule failed, IPv6 may bypass the tunnel: {e}"),
     }
     Ok(())
 }
