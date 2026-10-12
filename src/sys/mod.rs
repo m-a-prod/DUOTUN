@@ -25,7 +25,7 @@ use macos as imp;
 #[cfg(windows)]
 use windows as imp;
 #[cfg(windows)]
-pub use windows::skip_dad;
+pub use windows::{add_address, prepare_interface};
 
 #[derive(Debug, Clone)]
 pub struct SysConfig {

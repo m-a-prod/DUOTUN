@@ -103,6 +103,7 @@ pub async fn run_notify(
     ready: impl FnOnce(String),
 ) -> Result<()> {
     raise_fd_limit();
+    let started = std::time::Instant::now();
     if cfg.auto_route {
         sys::recover();
     }
@@ -117,29 +118,41 @@ pub async fn run_notify(
     let builder = builder.mtu_v4(cfg.mtu);
     #[cfg(not(windows))]
     let builder = builder.mtu(cfg.mtu);
-    // On Windows tun-rs turns the peer into a default-route gateway; our own
-    // split routes are installed later, so give it no peer there.
-    let mut builder = builder.ipv4(cfg.v4, 30, (!cfg!(windows)).then_some(cfg.v4_peer));
+    // Windows: the addresses are added below, once duplicate address
+    // detection is off (tun-rs would add them before that).
+    #[cfg(not(windows))]
+    let mut builder = builder.ipv4(cfg.v4, 30, Some(cfg.v4_peer));
     #[cfg(not(windows))]
     if let Some((v6, _)) = cfg.v6 {
         builder = builder.ipv6(v6, 126);
     }
+    #[cfg(windows)]
+    let mut builder = builder;
     if let Some(name) = &cfg.tun_name {
         builder = builder.name(name);
     }
     let dev = Arc::new(builder.build_async().context("creating TUN device (root required)")?);
-    // IPv6 off on this machine: tunnel IPv4 only (there is no IPv6 to leak).
     #[cfg(windows)]
-    if let Some((v6, _)) = cfg.v6
-        && let Err(e) = dev.set_mtu_v6(cfg.mtu).and_then(|()| dev.add_address_v6(v6, 126))
     {
-        warn!("no IPv6 on the TUN ({e}); IPv4 only");
-        cfg.v6 = None;
+        // Windows runs duplicate address detection on new addresses (IPv4
+        // too) and refuses binds until it ends: ~3 s per connect. Off first,
+        // then the addresses go in ready to use.
+        let index = dev.if_index()?;
+        sys::prepare_interface(index);
+        sys::add_address(index, cfg.v4.into(), 30).context("adding the TUN address")?;
+        // IPv6 off on this machine: tunnel IPv4 only (there is no IPv6 to leak).
+        if let Some((v6, _)) = cfg.v6
+            && let Err(e) = dev
+                .set_mtu_v6(cfg.mtu)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| sys::add_address(index, v6.into(), 126))
+        {
+            warn!("no IPv6 on the TUN ({e:#}); IPv4 only");
+            cfg.v6 = None;
+        }
     }
     let tun_name = dev.name()?;
-    #[cfg(windows)]
-    sys::skip_dad(&tun_name);
-    info!("tun {tun_name} up, mtu {}", cfg.mtu);
+    info!("tun {tun_name} up, mtu {}, in {:.2} s", cfg.mtu, started.elapsed().as_secs_f32());
 
     let l4 = bind_retry(SocketAddr::new(cfg.v4.into(), 0)).await?;
     let l6 = match cfg.v6 {
@@ -163,7 +176,9 @@ pub async fn run_notify(
         bypass,
         strict_dns: cfg.strict_dns,
     };
+    let applying = std::time::Instant::now();
     let undo = if cfg.auto_route { Some(Arc::new(Mutex::new(sys::apply(&sys_cfg)?))) } else { None };
+    info!("routes and DNS in {:.2} s", applying.elapsed().as_secs_f32());
 
     ready(tun_name.clone());
     let cancel = CancellationToken::new();

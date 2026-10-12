@@ -13,12 +13,69 @@ const FW_RULE: &str = "DUORAY DNS guard";
 const FW_INBOUND: &str = "DUORAY TUN";
 const FW_IPV6: &str = "DUORAY IPv6 guard";
 
-/// Turns off duplicate address detection on the new adapter so its addresses
-/// become usable at once (WireGuard does the same). Best effort.
-pub fn skip_dad(tun: &str) {
-    for family in ["ipv4", "ipv6"] {
-        let _ = run(&["netsh", "interface", family, "set", "interface", tun, "dadtransmits=0", "store=active"]);
+/// Before any address goes on the new adapter: no duplicate address
+/// detection (its addresses are usable at once; WireGuard does the same) and
+/// metric 1, so its routes and DNS server win. Per family; IPv6 may be off.
+pub fn prepare_interface(index: u32) {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpInterfaceEntry, MIB_IPINTERFACE_ROW, SetIpInterfaceEntry};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+    for family in [AF_INET, AF_INET6] {
+        let mut row = MIB_IPINTERFACE_ROW { Family: family, InterfaceIndex: index, ..Default::default() };
+        // SAFETY: Family and InterfaceIndex identify the row to fill.
+        if unsafe { GetIpInterfaceEntry(&mut row) } != 0 {
+            continue;
+        }
+        row.DadTransmits = 0;
+        row.UseAutomaticMetric = false;
+        row.Metric = 1;
+        // Read back as non-zero, rejected when written (see tun-rs).
+        row.SitePrefixLength = 0;
+        // SAFETY: a row just read for this interface.
+        let err = unsafe { SetIpInterfaceEntry(&mut row) };
+        if err != 0 {
+            warn!("TUN interface settings (family {family}): error {err}");
+        }
     }
+}
+
+/// Adds `addr/prefix` to the adapter, preferred at once (no tentative wait).
+pub fn add_address(index: u32, addr: IpAddr, prefix: u8) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_OBJECT_ALREADY_EXISTS;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_INET,
+    };
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: fills defaults into a local row.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceIndex = index;
+    row.OnLinkPrefixLength = prefix;
+    row.DadState = IpDadStatePreferred;
+    row.Address = match addr {
+        IpAddr::V4(a) => SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(a.octets()) } },
+                ..Default::default()
+            },
+        },
+        IpAddr::V6(a) => SOCKADDR_INET {
+            Ipv6: SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: a.octets() } },
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a fully initialised local row.
+    let err = unsafe { CreateUnicastIpAddressEntry(&row) };
+    if err != 0 && err != ERROR_OBJECT_ALREADY_EXISTS {
+        bail!("CreateUnicastIpAddressEntry {addr}/{prefix}: error {err}");
+    }
+    Ok(())
 }
 
 struct DefaultRoute {
@@ -83,8 +140,6 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
         "netsh", "interface", "ipv4", "set", "dnsservers", &format!("name={tun_idx}"), "source=static",
         &format!("address={peer}"), "register=none", "validate=no",
     ])?;
-    let _ = run(&["netsh", "interface", "ipv4", "set", "interface", &tun_idx, "metric=1"]);
-    let _ = run(&["netsh", "interface", "ipv6", "set", "interface", &tun_idx, "metric=1"]);
     let _ = run(&["ipconfig", "/flushdns"]);
 
     if cfg.strict_dns {
