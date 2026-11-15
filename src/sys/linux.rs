@@ -14,6 +14,7 @@
 //!   53 that would leave outside the TUN is DNATed into it, and whatever still
 //!   tries (sockets bound to the uplink) is rejected.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,12 +32,18 @@ struct DefaultRoute {
 
 /// The uplink the bypass routes currently point at (for [`refresh`]).
 static UPLINK: Mutex<Option<(DefaultRoute, Option<DefaultRoute>)>> = Mutex::new(None);
+/// Private half-routes already installed during this session (for [`refresh`]).
+static PRIVATE_ROUTES: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     let tun = cfg.tun_name.as_str();
     let v4 = default_route(false, tun).context("no IPv4 default route")?;
     let v6 = default_route(true, tun).ok();
-    info!("uplink: {} via {}", v4.dev, v4.gateway.as_deref().unwrap_or("link"));
+    info!(
+        "uplink: {} via {}",
+        v4.dev,
+        v4.gateway.as_deref().unwrap_or("link")
+    );
 
     loose_rp_filter(&v4.dev, log)?;
     route_bypass(cfg, &v4, v6.as_ref(), log)?;
@@ -52,8 +59,17 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
         }
     }
 
+    *PRIVATE_ROUTES.lock().unwrap() = Some(HashSet::new());
+    if cfg.route_private {
+        route_private_nets(cfg, log)?;
+    }
+
     allow_tun_input(tun, log)?;
-    let redirected = if cfg.strict_dns { guard_dns(cfg, log)? } else { false };
+    let redirected = if cfg.strict_dns {
+        guard_dns(cfg, log)?
+    } else {
+        false
+    };
     set_dns(cfg, log, redirected)?;
 
     *UPLINK.lock().unwrap() = Some((v4, v6));
@@ -63,23 +79,67 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
 /// Follows uplink changes (DHCP renewal with a new gateway, cable ↔ Wi-Fi):
 /// bypass routes are re-pointed and the new uplink gets loose rp_filter.
 pub fn refresh(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    if cfg.route_private {
+        route_private_nets(cfg, log)?;
+    }
     let tun = cfg.tun_name.as_str();
     // Network down: keep everything as is until a new uplink shows up.
-    let Ok(v4) = default_route(false, tun) else { return Ok(()) };
+    let Ok(v4) = default_route(false, tun) else {
+        return Ok(());
+    };
     let v6 = default_route(true, tun).ok();
     let mut current = UPLINK.lock().unwrap();
     if current.as_ref().is_some_and(|(a, b)| *a == v4 && *b == v6) {
         return Ok(());
     }
-    info!("uplink changed: {} via {}", v4.dev, v4.gateway.as_deref().unwrap_or("link"));
+    info!(
+        "uplink changed: {} via {}",
+        v4.dev,
+        v4.gateway.as_deref().unwrap_or("link")
+    );
     loose_rp_filter(&v4.dev, log)?;
     route_bypass(cfg, &v4, v6.as_ref(), log)?;
     *current = Some((v4, v6));
     Ok(())
 }
 
+fn route_private_nets(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    let tun = cfg.tun_name.as_str();
+    let mut routes = Vec::new();
+    if let Ok(out4) = run(&["ip", "-j", "-4", "route", "show"]) {
+        routes.extend(super::parse_ip_json_routes(&out4, tun));
+    }
+    if cfg.ipv6.is_some()
+        && let Ok(out6) = run(&["ip", "-j", "-6", "route", "show"])
+    {
+        routes.extend(super::parse_ip_json_routes(&out6, tun));
+    }
+    let halves = super::private_split_routes(&routes);
+    for cidr in halves {
+        let half = cidr.format();
+        let inserted = PRIVATE_ROUTES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(half.clone());
+        if !inserted {
+            continue;
+        }
+        let family = if cidr.is_ipv4() { "-4" } else { "-6" };
+        log.push_cmd(&["ip", family, "route", "del", &half, "dev", tun])?;
+        run(&["ip", family, "route", "replace", &half, "dev", tun])?;
+        info!("private route {half} -> {tun}");
+    }
+    Ok(())
+}
+
 /// Host routes for the proxy servers via the physical uplink.
-fn route_bypass(cfg: &SysConfig, v4: &DefaultRoute, v6: Option<&DefaultRoute>, log: &mut UndoLog) -> Result<()> {
+fn route_bypass(
+    cfg: &SysConfig,
+    v4: &DefaultRoute,
+    v6: Option<&DefaultRoute>,
+    log: &mut UndoLog,
+) -> Result<()> {
     for ip in &cfg.bypass {
         let (route, family, prefix) = match ip {
             IpAddr::V4(_) => (v4, "-4", 32),
@@ -112,12 +172,17 @@ fn loose_rp_filter(dev: &str, log: &mut UndoLog) -> Result<()> {
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())
     };
-    let (Some(all), Some(own)) = (read("all"), read(dev)) else { return Ok(()) };
+    let (Some(all), Some(own)) = (read("all"), read(dev)) else {
+        return Ok(());
+    };
     if all.max(own) != 1 {
         return Ok(());
     }
     let path = format!("/proc/sys/net/ipv4/conf/{dev}/rp_filter");
-    log.push(Undo::WriteFile { path: path.clone().into(), content: format!("{own}\n") })?;
+    log.push(Undo::WriteFile {
+        path: path.clone().into(),
+        content: format!("{own}\n"),
+    })?;
     std::fs::write(&path, "2\n").with_context(|| format!("writing {path}"))?;
     info!("rp_filter on {dev}: strict -> loose");
     Ok(())
@@ -139,8 +204,12 @@ fn allow_tun_input(tun: &str, log: &mut UndoLog) -> Result<()> {
     // iptables front-ends (ufw, docker, iptables.rules): insert at the top of INPUT.
     let iptables = has("iptables");
     for bin in ["iptables", "ip6tables"] {
-        let Ok(rules) = run(&[bin, "-w", "-S", "INPUT"]) else { continue };
-        let filtering = rules.lines().any(|l| l.starts_with("-P INPUT") && !l.ends_with("ACCEPT"))
+        let Ok(rules) = run(&[bin, "-w", "-S", "INPUT"]) else {
+            continue;
+        };
+        let filtering = rules
+            .lines()
+            .any(|l| l.starts_with("-P INPUT") && !l.ends_with("ACCEPT"))
             || rules.lines().any(|l| l.starts_with("-A INPUT"));
         if !filtering {
             continue;
@@ -165,26 +234,39 @@ fn allow_tun_input(tun: &str, log: &mut UndoLog) -> Result<()> {
     if !has("nft") {
         return Ok(());
     }
-    let Ok(out) = run(&["nft", "-j", "list", "chains"]) else { return Ok(()) };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&out) else { return Ok(()) };
+    let Ok(out) = run(&["nft", "-j", "list", "chains"]) else {
+        return Ok(());
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&out) else {
+        return Ok(());
+    };
     let skip_iptables_tables = iptables && iptables_is_nft();
     for item in json["nftables"].as_array().into_iter().flatten() {
         let c = &item["chain"];
         if c["hook"] != "input" || c["type"] != "filter" {
             continue;
         }
-        let (Some(family), Some(table), Some(chain)) = (c["family"].as_str(), c["table"].as_str(), c["name"].as_str())
-        else {
+        let (Some(family), Some(table), Some(chain)) = (
+            c["family"].as_str(),
+            c["table"].as_str(),
+            c["name"].as_str(),
+        ) else {
             continue;
         };
-        let iptables_owned = skip_iptables_tables && matches!(family, "ip" | "ip6") && table == "filter";
+        let iptables_owned =
+            skip_iptables_tables && matches!(family, "ip" | "ip6") && table == "filter";
         if table == "duotun" || table == "firewalld" || iptables_owned {
             continue;
         }
         let rule = format!("iifname \"{tun}\" accept");
-        match run(&["nft", "--echo", "--handle", "insert", "rule", family, table, chain, &rule]) {
+        match run(&[
+            "nft", "--echo", "--handle", "insert", "rule", family, table, chain, &rule,
+        ]) {
             Ok(echo) => {
-                let handle = echo.split("# handle ").nth(1).and_then(|h| h.split_whitespace().next());
+                let handle = echo
+                    .split("# handle ")
+                    .nth(1)
+                    .and_then(|h| h.split_whitespace().next());
                 if let Some(h) = handle {
                     log.push_cmd(&["nft", "delete", "rule", family, table, chain, "handle", h])?;
                 }
@@ -209,7 +291,9 @@ fn guard_dns(cfg: &SysConfig, log: &mut UndoLog) -> Result<bool> {
         let loaded = run(&["nft", "-f", path]);
         if loaded.is_ok() {
             let _ = std::fs::remove_file(path);
-            info!("strict dns: port 53 redirected into {tun}, blocked elsewhere (nft table inet duotun)");
+            info!(
+                "strict dns: port 53 redirected into {tun}, blocked elsewhere (nft table inet duotun)"
+            );
             return Ok(true);
         }
         // Old kernel or nft without NAT in inet tables: block only.
@@ -293,20 +377,39 @@ fn iptables_guard(tun: &str, dns: Ipv4Addr, ipv6: bool, log: &mut UndoLog) -> Re
     // (binary, table, built-in chain, our chain, rules)
     let mut plan: Vec<(&str, &str, &str, &str, Vec<Vec<&str>>)> = vec![];
     let reject = |bin: &'static str| -> Vec<Vec<&str>> {
-        let mut r = vec![vec!["-o", "lo", "-j", "RETURN"], vec!["-o", tun, "-j", "RETURN"]];
+        let mut r = vec![
+            vec!["-o", "lo", "-j", "RETURN"],
+            vec!["-o", tun, "-j", "RETURN"],
+        ];
         // `-o` still names the original device after DNAT moved a query into the TUN.
         if bin == "iptables" {
             r.push(vec!["-d", dns.as_str(), "-j", "RETURN"]);
         }
         for port in ["53", "853"] {
-            r.push(vec!["-p", "tcp", "--dport", port, "-j", "REJECT", "--reject-with", "tcp-reset"]);
+            r.push(vec![
+                "-p",
+                "tcp",
+                "--dport",
+                port,
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "tcp-reset",
+            ]);
             r.push(vec!["-p", "udp", "--dport", port, "-j", "REJECT"]);
         }
         if bin == "ip6tables" && !ipv6 {
             for net in ["fe80::/10", "fc00::/7", "ff00::/8"] {
                 r.insert(2, vec!["-d", net, "-j", "RETURN"]);
             }
-            r.push(vec!["-p", "tcp", "-j", "REJECT", "--reject-with", "tcp-reset"]);
+            r.push(vec![
+                "-p",
+                "tcp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "tcp-reset",
+            ]);
             r.push(vec!["-p", "udp", "-j", "REJECT"]);
         }
         r
@@ -319,16 +422,44 @@ fn iptables_guard(tun: &str, dns: Ipv4Addr, ipv6: bool, log: &mut UndoLog) -> Re
         } else {
             r.push(vec!["-o", tun, "-j", "RETURN"]);
         }
-        r.push(vec!["-m", "addrtype", "--dst-type", "LOCAL", "-j", "RETURN"]);
-        r.push(vec!["-p", "udp", "--dport", "53", "-j", "DNAT", "--to-destination", dns.as_str()]);
-        r.push(vec!["-p", "tcp", "--dport", "53", "-j", "DNAT", "--to-destination", dns.as_str()]);
+        r.push(vec![
+            "-m",
+            "addrtype",
+            "--dst-type",
+            "LOCAL",
+            "-j",
+            "RETURN",
+        ]);
+        r.push(vec![
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dns.as_str(),
+        ]);
+        r.push(vec![
+            "-p",
+            "tcp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dns.as_str(),
+        ]);
         r
     };
     // Last check on the real output device (the OUTPUT chain sees the
     // pre-DNAT one): a redirected query that still heads for the uplink, from
     // a socket bound to it, is dropped.
     let post = || -> Vec<Vec<&str>> {
-        let mut r = vec![vec!["-o", "lo", "-j", "RETURN"], vec!["-o", tun, "-j", "RETURN"]];
+        let mut r = vec![
+            vec!["-o", "lo", "-j", "RETURN"],
+            vec!["-o", tun, "-j", "RETURN"],
+        ];
         for port in ["53", "853"] {
             r.push(vec!["-p", "tcp", "--dport", port, "-j", "DROP"]);
             r.push(vec!["-p", "udp", "--dport", port, "-j", "DROP"]);
@@ -337,15 +468,29 @@ fn iptables_guard(tun: &str, dns: Ipv4Addr, ipv6: bool, log: &mut UndoLog) -> Re
     };
     plan.push(("iptables", "nat", "OUTPUT", "DUOTUN_DNS_OUT", dnat(false)));
     plan.push(("iptables", "nat", "PREROUTING", "DUOTUN_DNS_IN", dnat(true)));
-    plan.push(("iptables", "filter", "OUTPUT", "DUOTUN_OUT", reject("iptables")));
+    plan.push((
+        "iptables",
+        "filter",
+        "OUTPUT",
+        "DUOTUN_OUT",
+        reject("iptables"),
+    ));
     if has("ip6tables") {
-        plan.push(("ip6tables", "filter", "OUTPUT", "DUOTUN_OUT", reject("ip6tables")));
+        plan.push((
+            "ip6tables",
+            "filter",
+            "OUTPUT",
+            "DUOTUN_OUT",
+            reject("ip6tables"),
+        ));
         plan.push(("ip6tables", "mangle", "POSTROUTING", "DUOTUN_POST", post()));
     }
     plan.push(("iptables", "mangle", "POSTROUTING", "DUOTUN_POST", post()));
     for (bin, table, builtin, chain, rules) in plan {
         let base = [bin, "-w", "-t", table];
-        let cmd = |extra: &[&str]| -> Vec<String> { base.iter().chain(extra).map(|s| s.to_string()).collect() };
+        let cmd = |extra: &[&str]| -> Vec<String> {
+            base.iter().chain(extra).map(|s| s.to_string()).collect()
+        };
         // Leftovers of a crashed run would make -N fail.
         let _ = run_strs(&cmd(&["-D", builtin, "-j", chain]));
         let _ = run_strs(&cmd(&["-F", chain]));
@@ -377,7 +522,14 @@ fn iptables_guard(tun: &str, dns: Ipv4Addr, ipv6: bool, log: &mut UndoLog) -> Re
             }
         }
     }
-    info!("strict dns: port 53 {} (iptables)", if redirected { "redirected into the TUN" } else { "blocked outside the TUN" });
+    info!(
+        "strict dns: port 53 {} (iptables)",
+        if redirected {
+            "redirected into the TUN"
+        } else {
+            "blocked outside the TUN"
+        }
+    );
     Ok(redirected)
 }
 
@@ -387,24 +539,42 @@ fn run_strs(argv: &[String]) -> Result<String, RunError> {
 }
 
 fn default_route(v6: bool, tun: &str) -> Result<DefaultRoute> {
-    let out = run(&["ip", "-j", if v6 { "-6" } else { "-4" }, "route", "show", "default"])?;
+    let out = run(&[
+        "ip",
+        "-j",
+        if v6 { "-6" } else { "-4" },
+        "route",
+        "show",
+        "default",
+    ])?;
     let routes: Vec<serde_json::Value> = serde_json::from_str(&out)?;
     let mut found: Vec<(u64, DefaultRoute)> = routes
         .iter()
         .filter_map(|r| {
             // Multipath routes list their gateways under `nexthops`.
-            let hop = if r["dev"].is_string() { r } else { r["nexthops"].get(0)? };
+            let hop = if r["dev"].is_string() {
+                r
+            } else {
+                r["nexthops"].get(0)?
+            };
             let dev = hop["dev"].as_str()?.to_string();
             (dev != tun).then(|| {
                 (
                     r["metric"].as_u64().unwrap_or(0),
-                    DefaultRoute { gateway: hop["gateway"].as_str().map(String::from), dev },
+                    DefaultRoute {
+                        gateway: hop["gateway"].as_str().map(String::from),
+                        dev,
+                    },
                 )
             })
         })
         .collect();
     found.sort_by_key(|(metric, _)| *metric);
-    found.into_iter().next().map(|(_, r)| r).context("empty default route table")
+    found
+        .into_iter()
+        .next()
+        .map(|(_, r)| r)
+        .context("empty default route table")
 }
 
 /// systemd-resolved answers through its stub, i.e. /etc/resolv.conf points
@@ -419,7 +589,9 @@ fn resolved_in_use() -> bool {
         .map(str::trim)
         .collect();
     !servers.is_empty()
-        && servers.iter().all(|s| matches!(*s, "127.0.0.53" | "127.0.0.54"))
+        && servers
+            .iter()
+            .all(|s| matches!(*s, "127.0.0.53" | "127.0.0.54"))
         && run(&["resolvectl", "status"]).is_ok()
 }
 
@@ -443,7 +615,9 @@ fn set_dns(cfg: &SysConfig, log: &mut UndoLog, redirected: bool) -> Result<()> {
         match configured {
             Ok(_) => info!("dns via systemd-resolved on {tun} -> {dns}"),
             // Its upstream queries are redirected into the TUN anyway.
-            Err(e) if redirected => warn!("systemd-resolved not configured ({e}); relying on the redirect"),
+            Err(e) if redirected => {
+                warn!("systemd-resolved not configured ({e}); relying on the redirect")
+            }
             Err(e) => return Err(e.into()),
         }
         return Ok(());
@@ -459,12 +633,18 @@ fn set_dns(cfg: &SysConfig, log: &mut UndoLog, redirected: bool) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
             let target = std::fs::read_link(path)?;
-            log.push(Undo::Symlink { path: path.to_path_buf(), target })?;
+            log.push(Undo::Symlink {
+                path: path.to_path_buf(),
+                target,
+            })?;
             std::fs::remove_file(path)?;
         }
         _ => {
             let original = std::fs::read_to_string(path).unwrap_or_default();
-            log.push(Undo::WriteFile { path: path.to_path_buf(), content: original })?;
+            log.push(Undo::WriteFile {
+                path: path.to_path_buf(),
+                content: original,
+            })?;
         }
     }
     std::fs::write(path, format!("# written by duotun\nnameserver {dns}\n"))?;

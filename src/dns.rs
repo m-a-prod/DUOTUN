@@ -163,7 +163,9 @@ async fn worker<S: PacketSink>(
 }
 
 async fn deliver<S: PacketSink>(dgram: &[u8], pending: &mut HashMap<u16, Pending>, sink: &S) {
-    let Some((_, data)) = socks5::decode_udp(dgram) else { return };
+    let Some((_, data)) = socks5::decode_udp(dgram) else {
+        return;
+    };
     if data.len() < 12 {
         return;
     }
@@ -207,8 +209,16 @@ mod tests {
     #[ignore]
     async fn live_resolve_through_proxy() {
         let sink = Arc::new(Collect::default());
-        let socks = Arc::new(Socks5 { server: "127.0.0.1:17080".parse().unwrap(), auth: None });
-        let dns = Dns::spawn(sink.clone(), socks, "1.1.1.1:53".parse().unwrap(), CancellationToken::new());
+        let socks = Arc::new(Socks5 {
+            server: "127.0.0.1:17080".parse().unwrap(),
+            auth: None,
+        });
+        let dns = Dns::spawn(
+            sink.clone(),
+            socks,
+            "1.1.1.1:53".parse().unwrap(),
+            CancellationToken::new(),
+        );
 
         let dst: SocketAddr = "172.19.0.2:53".parse().unwrap();
         let n = 50u16;

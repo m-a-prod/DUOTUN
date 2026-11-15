@@ -52,6 +52,9 @@ pub struct Config {
     pub apps: Option<AppRules>,
     /// SOCKS whose traffic leaves directly (an xray inbound routed to freedom).
     pub direct_socks: Option<Socks5>,
+    /// Route private/LAN/CGNAT/ULA ranges into the TUN by splitting their OS routes
+    /// into halves so xray's routing rules can proxy or block them.
+    pub route_private: bool,
 }
 
 impl Default for Config {
@@ -75,6 +78,7 @@ impl Default for Config {
             strict_dns: true,
             apps: None,
             direct_socks: None,
+            route_private: false,
         }
     }
 }
@@ -131,7 +135,11 @@ pub async fn run_notify(
     if let Some(name) = &cfg.tun_name {
         builder = builder.name(name);
     }
-    let dev = Arc::new(builder.build_async().context("creating TUN device (root required)")?);
+    let dev = Arc::new(
+        builder
+            .build_async()
+            .context("creating TUN device (root required)")?,
+    );
     #[cfg(windows)]
     {
         // Windows runs duplicate address detection on new addresses (IPv4
@@ -152,7 +160,11 @@ pub async fn run_notify(
         }
     }
     let tun_name = dev.name()?;
-    info!("tun {tun_name} up, mtu {}, in {:.2} s", cfg.mtu, started.elapsed().as_secs_f32());
+    info!(
+        "tun {tun_name} up, mtu {}, in {:.2} s",
+        cfg.mtu,
+        started.elapsed().as_secs_f32()
+    );
 
     let l4 = bind_retry(SocketAddr::new(cfg.v4.into(), 0)).await?;
     let l6 = match cfg.v6 {
@@ -175,10 +187,18 @@ pub async fn run_notify(
         ipv6: cfg.v6.map(|(a, _)| a),
         bypass,
         strict_dns: cfg.strict_dns,
+        route_private: cfg.route_private,
     };
     let applying = std::time::Instant::now();
-    let undo = if cfg.auto_route { Some(Arc::new(Mutex::new(sys::apply(&sys_cfg)?))) } else { None };
-    info!("routes and DNS in {:.2} s", applying.elapsed().as_secs_f32());
+    let undo = if cfg.auto_route {
+        Some(Arc::new(Mutex::new(sys::apply(&sys_cfg)?)))
+    } else {
+        None
+    };
+    info!(
+        "routes and DNS in {:.2} s",
+        applying.elapsed().as_secs_f32()
+    );
 
     ready(tun_name.clone());
     let cancel = CancellationToken::new();
@@ -208,13 +228,16 @@ pub async fn run_notify(
 /// Keeps routes in line with the uplink while the tunnel is up. Never returns.
 async fn follow_network(cfg: &sys::SysConfig, undo: Option<Arc<Mutex<sys::UndoLog>>>) {
     // Only Linux follows the uplink so far; elsewhere this just waits.
-    let Some(undo) = undo.filter(|_| cfg!(target_os = "linux")) else { return std::future::pending().await };
+    let Some(undo) = undo.filter(|_| cfg!(target_os = "linux")) else {
+        return std::future::pending().await;
+    };
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     tick.tick().await;
     loop {
         tick.tick().await;
         let (cfg, undo) = (cfg.clone(), undo.clone());
-        let r = tokio::task::spawn_blocking(move || sys::refresh(&cfg, &mut undo.lock().unwrap())).await;
+        let r = tokio::task::spawn_blocking(move || sys::refresh(&cfg, &mut undo.lock().unwrap()))
+            .await;
         if let Ok(Err(e)) = r {
             warn!("network refresh failed: {e:#}");
         }
@@ -263,9 +286,23 @@ async fn serve(
         .map(|upstream| Dns::spawn(sink.clone(), socks.clone(), upstream, cancel.clone()));
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(tcp::serve(l4, nat.clone(), cfg.v4_peer.into(), routes.clone(), cfg.dns, cancel.clone()));
+    tasks.spawn(tcp::serve(
+        l4,
+        nat.clone(),
+        cfg.v4_peer.into(),
+        routes.clone(),
+        cfg.dns,
+        cancel.clone(),
+    ));
     if let (Some(l), Some((_, peer))) = (l6, cfg.v6) {
-        tasks.spawn(tcp::serve(l, nat.clone(), peer.into(), routes.clone(), cfg.dns, cancel.clone()));
+        tasks.spawn(tcp::serve(
+            l,
+            nat.clone(),
+            peer.into(),
+            routes.clone(),
+            cfg.dns,
+            cancel.clone(),
+        ));
     }
     {
         let nat = nat.clone();
@@ -355,7 +392,10 @@ async fn bind_retry(addr: SocketAddr) -> Result<TcpListener> {
 /// macOS gives processes started from a shell (and sudo) a soft limit of 256.
 #[cfg(unix)]
 fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: plain syscalls on a stack-allocated struct.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {

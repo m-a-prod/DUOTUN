@@ -6,7 +6,10 @@ use duotun::process::{AppMode, AppRules};
 
 fn main() {
     let apps: Vec<String> = std::env::args().skip(1).collect();
-    let rules = AppRules { mode: AppMode::Bypass, apps };
+    let rules = AppRules {
+        mode: AppMode::Bypass,
+        apps,
+    };
     for tcp in [true, false] {
         let table = duotun::process::scan_table(tcp);
         let mut hits = 0;
@@ -17,10 +20,18 @@ fn main() {
             {
                 hits += 1;
                 if hits <= 5 {
-                    println!("{} port {port} pid {pid} {}", if tcp { "tcp" } else { "udp" }, e.display());
+                    println!(
+                        "{} port {port} pid {pid} {}",
+                        if tcp { "tcp" } else { "udp" },
+                        e.display()
+                    );
                 }
             }
         }
-        println!("{}: {} sockets, {hits} match", if tcp { "tcp" } else { "udp" }, table.len());
+        println!(
+            "{}: {} sockets, {hits} match",
+            if tcp { "tcp" } else { "udp" },
+            table.len()
+        );
     }
 }

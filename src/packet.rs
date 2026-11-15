@@ -78,7 +78,14 @@ fn parse_v6(pkt: &[u8]) -> Option<Parsed> {
     )
 }
 
-fn finish(pkt: &[u8], proto: u8, src: IpAddr, dst: IpAddr, l4: usize, end: usize) -> Option<Parsed> {
+fn finish(
+    pkt: &[u8],
+    proto: u8,
+    src: IpAddr,
+    dst: IpAddr,
+    l4: usize,
+    end: usize,
+) -> Option<Parsed> {
     let min = match proto {
         PROTO_TCP => 20,
         PROTO_UDP => 8,
@@ -119,7 +126,10 @@ pub fn rewrite_tcp(pkt: &mut [u8], p: &Parsed, new_src: SocketAddr, new_dst: Soc
     match (p.src.ip(), p.dst.ip(), new_src.ip(), new_dst.ip()) {
         (IpAddr::V4(os), IpAddr::V4(od), IpAddr::V4(ns), IpAddr::V4(nd)) => {
             let mut ip_csum = u16::from_be_bytes([pkt[10], pkt[11]]);
-            for (old, new, off) in [(os.octets(), ns.octets(), 12), (od.octets(), nd.octets(), 16)] {
+            for (old, new, off) in [
+                (os.octets(), ns.octets(), 12),
+                (od.octets(), nd.octets(), 16),
+            ] {
                 ip_csum = csum_replace(ip_csum, &old, &new);
                 tcp_csum = csum_replace(tcp_csum, &old, &new);
                 pkt[off..off + 4].copy_from_slice(&new);
@@ -127,7 +137,10 @@ pub fn rewrite_tcp(pkt: &mut [u8], p: &Parsed, new_src: SocketAddr, new_dst: Soc
             pkt[10..12].copy_from_slice(&ip_csum.to_be_bytes());
         }
         (IpAddr::V6(os), IpAddr::V6(od), IpAddr::V6(ns), IpAddr::V6(nd)) => {
-            for (old, new, off) in [(os.octets(), ns.octets(), 8), (od.octets(), nd.octets(), 24)] {
+            for (old, new, off) in [
+                (os.octets(), ns.octets(), 8),
+                (od.octets(), nd.octets(), 24),
+            ] {
                 tcp_csum = csum_replace(tcp_csum, &old, &new);
                 pkt[off..off + 16].copy_from_slice(&new);
             }
@@ -272,7 +285,9 @@ mod tests {
         let mut pkt = vec![0x45, 0];
         pkt.extend_from_slice(&(total as u16).to_be_bytes());
         pkt.extend_from_slice(&[0, 1, 0x40, 0, 64, PROTO_TCP, 0, 0]);
-        let (IpAddr::V4(s), IpAddr::V4(d)) = (src.ip(), dst.ip()) else { unreachable!() };
+        let (IpAddr::V4(s), IpAddr::V4(d)) = (src.ip(), dst.ip()) else {
+            unreachable!()
+        };
         pkt.extend_from_slice(&s.octets());
         pkt.extend_from_slice(&d.octets());
         let c = !fold(sum16(&pkt));
@@ -332,7 +347,11 @@ mod tests {
 
     #[test]
     fn drops_fragments() {
-        let mut pkt = tcp_v4("10.0.0.1:1".parse().unwrap(), "10.0.0.2:2".parse().unwrap(), b"");
+        let mut pkt = tcp_v4(
+            "10.0.0.1:1".parse().unwrap(),
+            "10.0.0.2:2".parse().unwrap(),
+            b"",
+        );
         pkt[6] |= 0x20; // MF
         assert!(parse(&pkt).is_none());
     }

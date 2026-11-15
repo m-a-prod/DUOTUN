@@ -48,14 +48,44 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     // 2. Everything else into the TUN. Two /1 halves beat 0.0.0.0/0 without touching the default route.
     let tun = cfg.tun_name.as_str();
     for net in ["0.0.0.0/1", "128.0.0.0/1"] {
-        log.push_cmd(&["/sbin/route", "-n", "delete", "-net", net, "-interface", tun])?;
+        log.push_cmd(&[
+            "/sbin/route",
+            "-n",
+            "delete",
+            "-net",
+            net,
+            "-interface",
+            tun,
+        ])?;
         run(&["/sbin/route", "-n", "add", "-net", net, "-interface", tun])?;
     }
     if cfg.ipv6.is_some() {
         for net in ["::/1", "8000::/1"] {
-            log.push_cmd(&["/sbin/route", "-n", "delete", "-inet6", "-net", net, "-interface", tun])?;
-            run(&["/sbin/route", "-n", "add", "-inet6", "-net", net, "-interface", tun])?;
+            log.push_cmd(&[
+                "/sbin/route",
+                "-n",
+                "delete",
+                "-inet6",
+                "-net",
+                net,
+                "-interface",
+                tun,
+            ])?;
+            run(&[
+                "/sbin/route",
+                "-n",
+                "add",
+                "-inet6",
+                "-net",
+                net,
+                "-interface",
+                tun,
+            ])?;
         }
+    }
+
+    if cfg.route_private {
+        route_private_nets(cfg, log)?;
     }
 
     // 3. Point every network service's resolver into the TUN, so LAN DNS servers
@@ -91,10 +121,39 @@ fn block_dns_outside_tun(tun: &str, log: &mut UndoLog) -> Result<()> {
     let (out, err) = run_full(&["/sbin/pfctl", "-E"])?;
     let token = format!("{out}\n{err}")
         .lines()
-        .find_map(|l| l.trim().strip_prefix("Token :").map(|t| t.trim().to_string()))
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("Token :")
+                .map(|t| t.trim().to_string())
+        })
         .context("pfctl -E returned no token")?;
     log.push_cmd(&["/sbin/pfctl", "-X", &token])?;
     info!("strict dns: port 53 blocked outside {tun} (pf anchor {PF_ANCHOR})");
+    Ok(())
+}
+
+fn route_private_nets(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    let tun = cfg.tun_name.as_str();
+    let mut routes = Vec::new();
+    if let Ok(out4) = run(&["/usr/sbin/netstat", "-rn", "-f", "inet"]) {
+        routes.extend(super::parse_netstat_routes(&out4, false, tun));
+    }
+    if cfg.ipv6.is_some()
+        && let Ok(out6) = run(&["/usr/sbin/netstat", "-rn", "-f", "inet6"])
+    {
+        routes.extend(super::parse_netstat_routes(&out6, true, tun));
+    }
+    for cidr in super::private_split_routes(&routes) {
+        let half = cidr.format();
+        if cidr.is_ipv4() {
+            log.push_cmd(&["/sbin/route", "-n", "delete", "-net", &half, "-interface", tun])?;
+            run(&["/sbin/route", "-n", "add", "-net", &half, "-interface", tun])?;
+        } else {
+            log.push_cmd(&["/sbin/route", "-n", "delete", "-inet6", "-net", &half, "-interface", tun])?;
+            run(&["/sbin/route", "-n", "add", "-inet6", "-net", &half, "-interface", tun])?;
+        }
+        info!("private route {half} -> {tun}");
+    }
     Ok(())
 }
 
@@ -122,11 +181,17 @@ fn default_route(v6: bool) -> Result<DefaultRoute> {
 fn has_scoped_default(output: &str, iface: &str) -> bool {
     let scoped = output.lines().any(|line| {
         line.trim().strip_prefix("flags:").is_some_and(|flags| {
-            flags.trim().trim_matches(['<', '>']).split(',').any(|flag| flag.trim() == "IFSCOPE")
+            flags
+                .trim()
+                .trim_matches(['<', '>'])
+                .split(',')
+                .any(|flag| flag.trim() == "IFSCOPE")
         })
     });
     let same_interface = output.lines().any(|line| {
-        line.trim().strip_prefix("interface:").is_some_and(|value| value.trim() == iface)
+        line.trim()
+            .strip_prefix("interface:")
+            .is_some_and(|value| value.trim() == iface)
     });
     scoped && same_interface
 }
@@ -134,13 +199,29 @@ fn has_scoped_default(output: &str, iface: &str) -> bool {
 /// Retain an existing scoped default; record only the route we need to add.
 fn ensure_scoped_default(v6: bool, via: &DefaultRoute, log: &mut UndoLog) -> Result<()> {
     let family = if v6 { "-inet6" } else { "-inet" };
-    let current = run(&["/sbin/route", "-n", "get", family, "-ifscope", &via.iface, "default"])
-        .unwrap_or_default();
+    let current = run(&[
+        "/sbin/route",
+        "-n",
+        "get",
+        family,
+        "-ifscope",
+        &via.iface,
+        "default",
+    ])
+    .unwrap_or_default();
     if has_scoped_default(&current, &via.iface) {
         return Ok(());
     }
 
-    log.push_cmd(&["/sbin/route", "-n", "delete", family, "default", "-ifscope", &via.iface])?;
+    log.push_cmd(&[
+        "/sbin/route",
+        "-n",
+        "delete",
+        family,
+        "default",
+        "-ifscope",
+        &via.iface,
+    ])?;
     let mut add = vec!["/sbin/route", "-n", "add", family, "default"];
     match &via.gateway {
         Some(gateway) => add.push(gateway),
@@ -149,8 +230,12 @@ fn ensure_scoped_default(v6: bool, via: &DefaultRoute, log: &mut UndoLog) -> Res
     add.extend(["-ifscope", via.iface.as_str()]);
     // Best effort: without it only direct (bypassing) traffic breaks, the tunnel still works.
     match run(&add) {
-        Ok(_) => info!(iface = %via.iface, ipv6 = v6, "scoped uplink route ready for direct connections"),
-        Err(e) => warn!(iface = %via.iface, ipv6 = v6, "no scoped uplink route, direct connections may fail: {e}"),
+        Ok(_) => {
+            info!(iface = %via.iface, ipv6 = v6, "scoped uplink route ready for direct connections")
+        }
+        Err(e) => {
+            warn!(iface = %via.iface, ipv6 = v6, "no scoped uplink route, direct connections may fail: {e}")
+        }
     }
     Ok(())
 }
@@ -179,7 +264,11 @@ fn add_host_route(ip: IpAddr, via: &DefaultRoute, log: &mut UndoLog) -> Result<(
 fn set_dns(server: &str, log: &mut UndoLog) -> Result<()> {
     let services = run(&["/usr/sbin/networksetup", "-listallnetworkservices"])?;
     // First line is a legend; disabled services are prefixed with '*'.
-    for svc in services.lines().skip(1).filter(|s| !s.starts_with('*') && !s.is_empty()) {
+    for svc in services
+        .lines()
+        .skip(1)
+        .filter(|s| !s.starts_with('*') && !s.is_empty())
+    {
         let current = run(&["/usr/sbin/networksetup", "-getdnsservers", svc])?;
         let mut restore: Vec<String> = current
             .lines()

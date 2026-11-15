@@ -59,6 +59,9 @@ struct RunArgs {
     /// SOCKS5 that sends traffic direct (same credentials as --socks).
     #[arg(long)]
     direct_socks: Option<SocketAddr>,
+    /// Route private/LAN/CGNAT/ULA networks into the TUN by splitting their routes.
+    #[arg(long)]
+    route_private: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -98,10 +101,14 @@ async fn run(a: RunArgs) -> Result<()> {
         auto_route: !a.no_auto_route,
         bypass: resolve_all(&a.bypass)?,
         strict_dns: !a.no_strict_dns,
+        route_private: a.route_private,
         ..Default::default()
     };
     if let Some(direct) = a.direct_socks {
-        cfg.direct_socks = Some(Socks5 { server: direct, auth: cfg.socks.auth.clone() });
+        cfg.direct_socks = Some(Socks5 {
+            server: direct,
+            auth: cfg.socks.auth.clone(),
+        });
         let mode = match a.app_mode {
             AppModeArg::Bypass => duotun::process::AppMode::Bypass,
             AppModeArg::Only => duotun::process::AppMode::Only,

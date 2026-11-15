@@ -17,10 +17,16 @@ const FW_IPV6: &str = "DUORAY IPv6 guard";
 /// detection (its addresses are usable at once; WireGuard does the same) and
 /// metric 1, so its routes and DNS server win. Per family; IPv6 may be off.
 pub fn prepare_interface(index: u32) {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpInterfaceEntry, MIB_IPINTERFACE_ROW, SetIpInterfaceEntry};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetIpInterfaceEntry, MIB_IPINTERFACE_ROW, SetIpInterfaceEntry,
+    };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
     for family in [AF_INET, AF_INET6] {
-        let mut row = MIB_IPINTERFACE_ROW { Family: family, InterfaceIndex: index, ..Default::default() };
+        let mut row = MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceIndex: index,
+            ..Default::default()
+        };
         // SAFETY: Family and InterfaceIndex identify the row to fill.
         if unsafe { GetIpInterfaceEntry(&mut row) } != 0 {
             continue;
@@ -45,8 +51,8 @@ pub fn add_address(index: u32, addr: IpAddr, prefix: u8) -> Result<()> {
         CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
     };
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
-        SOCKADDR_INET,
+        AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, IpDadStatePreferred,
+        SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
     };
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
     // SAFETY: fills defaults into a local row.
@@ -58,14 +64,20 @@ pub fn add_address(index: u32, addr: IpAddr, prefix: u8) -> Result<()> {
         IpAddr::V4(a) => SOCKADDR_INET {
             Ipv4: SOCKADDR_IN {
                 sin_family: AF_INET,
-                sin_addr: IN_ADDR { S_un: IN_ADDR_0 { S_addr: u32::from_ne_bytes(a.octets()) } },
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes(a.octets()),
+                    },
+                },
                 ..Default::default()
             },
         },
         IpAddr::V6(a) => SOCKADDR_INET {
             Ipv6: SOCKADDR_IN6 {
                 sin6_family: AF_INET6,
-                sin6_addr: IN6_ADDR { u: IN6_ADDR_0 { Byte: a.octets() } },
+                sin6_addr: IN6_ADDR {
+                    u: IN6_ADDR_0 { Byte: a.octets() },
+                },
                 ..Default::default()
             },
         },
@@ -98,7 +110,16 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
             IpAddr::V4(_) => {
                 log.push_cmd(&["route", "DELETE", &ip_s])?;
                 run(&[
-                    "route", "ADD", &ip_s, "MASK", "255.255.255.255", &v4.gateway, "IF", &v4.if_index.to_string(), "METRIC", "1",
+                    "route",
+                    "ADD",
+                    &ip_s,
+                    "MASK",
+                    "255.255.255.255",
+                    &v4.gateway,
+                    "IF",
+                    &v4.if_index.to_string(),
+                    "METRIC",
+                    "1",
                 ])?;
             }
             IpAddr::V6(_) => {
@@ -109,7 +130,17 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
                 let dst = format!("{ip_s}/128");
                 let idx = r.if_index.to_string();
                 log.push_cmd(&["netsh", "interface", "ipv6", "delete", "route", &dst, &idx])?;
-                run(&["netsh", "interface", "ipv6", "add", "route", &dst, &idx, &r.gateway, "store=active"])?;
+                run(&[
+                    "netsh",
+                    "interface",
+                    "ipv6",
+                    "add",
+                    "route",
+                    &dst,
+                    &idx,
+                    &r.gateway,
+                    "store=active",
+                ])?;
             }
         }
         info!("bypass {ip}");
@@ -124,21 +155,61 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     let tun_idx = tun_index.to_string();
     for net in ["0.0.0.0", "128.0.0.0"] {
         log.push_cmd(&["route", "DELETE", net, "MASK", "128.0.0.0", &peer])?;
-        run(&["route", "ADD", net, "MASK", "128.0.0.0", &peer, "IF", &tun_idx, "METRIC", "1"])?;
+        run(&[
+            "route",
+            "ADD",
+            net,
+            "MASK",
+            "128.0.0.0",
+            &peer,
+            "IF",
+            &tun_idx,
+            "METRIC",
+            "1",
+        ])?;
     }
     if cfg.ipv6.is_some() {
         for net in ["::/1", "8000::/1"] {
-            log.push_cmd(&["netsh", "interface", "ipv6", "delete", "route", net, &tun_idx])?;
-            run(&["netsh", "interface", "ipv6", "add", "route", net, &tun_idx, "store=active"])?;
+            log.push_cmd(&[
+                "netsh",
+                "interface",
+                "ipv6",
+                "delete",
+                "route",
+                net,
+                &tun_idx,
+            ])?;
+            run(&[
+                "netsh",
+                "interface",
+                "ipv6",
+                "add",
+                "route",
+                net,
+                &tun_idx,
+                "store=active",
+            ])?;
         }
     } else if v6.is_some() {
         block_ipv6_outside_tun(cfg, log)?;
     }
 
+    if cfg.route_private {
+        route_private_nets(cfg, tun_index, &peer, &tun_idx, log)?;
+    }
+
     // 3. The TUN's resolver, preferred over every other adapter.
     run(&[
-        "netsh", "interface", "ipv4", "set", "dnsservers", &format!("name={tun_idx}"), "source=static",
-        &format!("address={peer}"), "register=none", "validate=no",
+        "netsh",
+        "interface",
+        "ipv4",
+        "set",
+        "dnsservers",
+        &format!("name={tun_idx}"),
+        "source=static",
+        &format!("address={peer}"),
+        "register=none",
+        "validate=no",
     ])?;
     let _ = run(&["ipconfig", "/flushdns"]);
 
@@ -154,8 +225,17 @@ fn allow_inbound_on_tun(log: &mut UndoLog) -> Result<()> {
     let _ = run(&["netsh", "advfirewall", "firewall", "delete", "rule", &name]);
     log.push_cmd(&["netsh", "advfirewall", "firewall", "delete", "rule", &name])?;
     if let Err(e) = run(&[
-        "netsh", "advfirewall", "firewall", "add", "rule", &name, "dir=in", "action=allow", "protocol=TCP",
-        &format!("program={exe}"), "enable=yes",
+        "netsh",
+        "advfirewall",
+        "firewall",
+        "add",
+        "rule",
+        &name,
+        "dir=in",
+        "action=allow",
+        "protocol=TCP",
+        &format!("program={exe}"),
+        "enable=yes",
     ]) {
         warn!("could not add the inbound firewall rule: {e}");
     }
@@ -175,7 +255,17 @@ fn block_ipv6_outside_tun(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     let name = format!("name={FW_IPV6}");
     let _ = run(&["netsh", "advfirewall", "firewall", "delete", "rule", &name]);
     log.push_cmd(&["netsh", "advfirewall", "firewall", "delete", "rule", &name])?;
-    match run(&["netsh", "advfirewall", "firewall", "add", "rule", &name, "dir=out", "action=block", "remoteip=2000::/3"]) {
+    match run(&[
+        "netsh",
+        "advfirewall",
+        "firewall",
+        "add",
+        "rule",
+        &name,
+        "dir=out",
+        "action=block",
+        "remoteip=2000::/3",
+    ]) {
         Ok(_) => info!("no IPv6 on the TUN: internet IPv6 blocked (Windows Firewall)"),
         Err(e) => warn!("firewall rule failed, IPv6 may bypass the tunnel: {e}"),
     }
@@ -190,14 +280,25 @@ fn block_dns_outside_tun(dns: &str, log: &mut UndoLog) -> Result<()> {
     };
     let below = std::net::Ipv4Addr::from(u32::from(ip) - 1);
     let above = std::net::Ipv4Addr::from(u32::from(ip) + 1);
-    let ranges = format!("0.0.0.0-{below},{above}-255.255.255.255,::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
+    let ranges = format!(
+        "0.0.0.0-{below},{above}-255.255.255.255,::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"
+    );
     let name = format!("name={FW_RULE}");
     let _ = run(&["netsh", "advfirewall", "firewall", "delete", "rule", &name]);
     log.push_cmd(&["netsh", "advfirewall", "firewall", "delete", "rule", &name])?;
     for proto in ["UDP", "TCP"] {
         let r = run(&[
-            "netsh", "advfirewall", "firewall", "add", "rule", &name, "dir=out", "action=block",
-            &format!("protocol={proto}"), "remoteport=53", &format!("remoteip={ranges}"),
+            "netsh",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &name,
+            "dir=out",
+            "action=block",
+            &format!("protocol={proto}"),
+            "remoteport=53",
+            &format!("remoteip={ranges}"),
         ]);
         if let Err(e) = r {
             warn!("firewall rule failed, strict DNS is NOT active: {e}");
@@ -212,7 +313,9 @@ fn block_dns_outside_tun(dns: &str, log: &mut UndoLog) -> Result<()> {
 // PowerShell start used to cost about two seconds of the connect time.
 
 fn adapter_index(name: &str) -> Result<u32> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex,
+    };
     use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     let alias: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // The adapter may take a moment to appear after Wintun creates it.
@@ -234,8 +337,8 @@ fn adapter_index(name: &str) -> Result<u32> {
 /// interface metric, as the stack itself picks it.
 fn default_route(v6: bool, tun_index: u32) -> Result<DefaultRoute> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, MIB_IF_ROW2, MIB_IPFORWARD_TABLE2,
-        MIB_IPINTERFACE_ROW,
+        FreeMibTable, GetIfEntry2, GetIpForwardTable2, GetIpInterfaceEntry, MIB_IF_ROW2,
+        MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
     let family = if v6 { AF_INET6 } else { AF_INET };
@@ -246,13 +349,19 @@ fn default_route(v6: bool, tun_index: u32) -> Result<DefaultRoute> {
         bail!("GetIpForwardTable2: error {err}");
     }
     // SAFETY: the table holds NumEntries rows.
-    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
     let mut best: Option<(u32, DefaultRoute)> = None;
     for row in rows {
         if row.DestinationPrefix.PrefixLength != 0 || row.InterfaceIndex == tun_index {
             continue;
         }
-        let mut iface = MIB_IPINTERFACE_ROW { Family: family, InterfaceLuid: row.InterfaceLuid, ..Default::default() };
+        let mut iface = MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceLuid: row.InterfaceLuid,
+            ..Default::default()
+        };
         // SAFETY: Family and InterfaceLuid identify the row to fill.
         if unsafe { GetIpInterfaceEntry(&mut iface) } != 0 || !iface.Connected {
             continue;
@@ -269,14 +378,117 @@ fn default_route(v6: bool, tun_index: u32) -> Result<DefaultRoute> {
                 IpAddr::from(row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes()).to_string()
             }
         };
-        let mut entry = MIB_IF_ROW2 { InterfaceLuid: row.InterfaceLuid, ..Default::default() };
+        let mut entry = MIB_IF_ROW2 {
+            InterfaceLuid: row.InterfaceLuid,
+            ..Default::default()
+        };
         // SAFETY: InterfaceLuid identifies the row to fill.
-        let alias = if unsafe { GetIfEntry2(&mut entry) } == 0 { wide(&entry.Alias) } else { String::new() };
-        best = Some((metric, DefaultRoute { gateway, if_index: row.InterfaceIndex, alias }));
+        let alias = if unsafe { GetIfEntry2(&mut entry) } == 0 {
+            wide(&entry.Alias)
+        } else {
+            String::new()
+        };
+        best = Some((
+            metric,
+            DefaultRoute {
+                gateway,
+                if_index: row.InterfaceIndex,
+                alias,
+            },
+        ));
     }
     // SAFETY: allocated by GetIpForwardTable2 above.
     unsafe { FreeMibTable(table.cast()) };
     best.map(|(_, r)| r).context("no default route")
+}
+
+fn route_private_nets(
+    cfg: &SysConfig,
+    tun_index: u32,
+    peer: &str,
+    tun_idx: &str,
+    log: &mut UndoLog,
+) -> Result<()> {
+    let mut routes = collect_routes(false, tun_index);
+    if cfg.ipv6.is_some() {
+        routes.extend(collect_routes(true, tun_index));
+    }
+    for cidr in super::private_split_routes(&routes) {
+        match cidr.net {
+            IpAddr::V4(net) => {
+                let net_s = net.to_string();
+                let mask_s = super::ipv4_netmask(cidr.prefix).to_string();
+                log.push_cmd(&["route", "DELETE", &net_s, "MASK", &mask_s, peer])?;
+                run(&[
+                    "route",
+                    "ADD",
+                    &net_s,
+                    "MASK",
+                    &mask_s,
+                    peer,
+                    "IF",
+                    tun_idx,
+                    "METRIC",
+                    "1",
+                ])?;
+            }
+            IpAddr::V6(_) => {
+                let cidr_s = cidr.format();
+                log.push_cmd(&["netsh", "interface", "ipv6", "delete", "route", &cidr_s, tun_idx])?;
+                run(&[
+                    "netsh",
+                    "interface",
+                    "ipv6",
+                    "add",
+                    "route",
+                    &cidr_s,
+                    tun_idx,
+                    "store=active",
+                ])?;
+            }
+        }
+        info!("private route {} -> {tun_idx}", cidr.format());
+    }
+    Ok(())
+}
+
+fn collect_routes(v6: bool, tun_index: u32) -> Vec<super::Cidr> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let family = if v6 { AF_INET6 } else { AF_INET };
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: on success the table is ours until FreeMibTable.
+    if unsafe { GetIpForwardTable2(family, &mut table) } != 0 {
+        return vec![];
+    }
+    // SAFETY: the table holds NumEntries rows.
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.InterfaceIndex == tun_index {
+            continue;
+        }
+        let prefix = row.DestinationPrefix.PrefixLength;
+        // SAFETY: the union member matches the table's address family.
+        let ip = unsafe {
+            if v6 {
+                IpAddr::from(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte)
+            } else {
+                IpAddr::from(row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes())
+            }
+        };
+        if let Some(cidr) = super::Cidr::new(ip, prefix) {
+            out.push(cidr);
+        }
+    }
+    // SAFETY: allocated by GetIpForwardTable2 above.
+    unsafe { FreeMibTable(table.cast()) };
+    out
 }
 
 fn wide(s: &[u16]) -> String {

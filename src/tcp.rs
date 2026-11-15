@@ -9,9 +9,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use crate::Routes;
 use crate::nat::Nat;
 use crate::packet::{self, Parsed};
-use crate::Routes;
 use crate::socks5::Socks5;
 
 /// Local listener for one address family.
@@ -106,7 +106,9 @@ pub async fn serve(
                 }
                 warn!(%addr, "tcp listener failed ({e}), listening again");
                 drop(listener);
-                listener = relisten(addr).await.map_err(|re| std::io::Error::new(re.kind(), format!("{e}; listening again: {re}")))?;
+                listener = relisten(addr).await.map_err(|re| {
+                    std::io::Error::new(re.kind(), format!("{e}; listening again: {re}"))
+                })?;
                 continue;
             }
         };
@@ -128,7 +130,11 @@ pub async fn serve(
         let cancel = cancel.clone();
         tokio::spawn(async move {
             // DNS always goes through the proxy, whichever app asks.
-            let socks = if is_dns { &routes.proxy } else { routes.pick(flow.src, true).await };
+            let socks = if is_dns {
+                &routes.proxy
+            } else {
+                routes.pick(flow.src, true).await
+            };
             tokio::select! {
                 r = relay(stream, target, socks) => {
                     if let Err(e) = r {
@@ -145,7 +151,10 @@ pub async fn serve(
 /// Errors of one accept, not of the listener: retry right away.
 fn accept_error_is_transient(e: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
-    if matches!(e.kind(), ConnectionAborted | ConnectionReset | Interrupted | WouldBlock) {
+    if matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionReset | Interrupted | WouldBlock
+    ) {
         return true;
     }
     // Out of file descriptors: connections close and free some.
@@ -161,7 +170,11 @@ fn accept_error_is_transient(e: &std::io::Error) -> bool {
 async fn relisten(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let mut last = None;
     for _ in 0..30 {
-        let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
         socket.set_reuseaddr(true)?;
         match socket.bind(addr).and_then(|()| socket.listen(1024)) {
             Ok(l) => return Ok(l),
@@ -204,12 +217,20 @@ mod listener_tests {
     #[test]
     fn per_accept_errors_are_retried() {
         use std::io::{Error, ErrorKind};
-        assert!(accept_error_is_transient(&Error::from(ErrorKind::ConnectionAborted)));
-        assert!(!accept_error_is_transient(&Error::from(ErrorKind::InvalidInput)));
+        assert!(accept_error_is_transient(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(!accept_error_is_transient(&Error::from(
+            ErrorKind::InvalidInput
+        )));
         #[cfg(unix)]
         {
-            assert!(accept_error_is_transient(&Error::from_raw_os_error(libc::EMFILE)));
-            assert!(!accept_error_is_transient(&Error::from_raw_os_error(libc::EINVAL)));
+            assert!(accept_error_is_transient(&Error::from_raw_os_error(
+                libc::EMFILE
+            )));
+            assert!(!accept_error_is_transient(&Error::from_raw_os_error(
+                libc::EINVAL
+            )));
         }
     }
 }

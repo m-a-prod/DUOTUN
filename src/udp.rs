@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
-use crate::packet;
 use crate::Routes;
+use crate::packet;
 use crate::socks5;
 
 const QUEUE: usize = 256;
