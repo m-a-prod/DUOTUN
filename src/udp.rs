@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::Routes;
 use crate::packet;
@@ -66,7 +66,7 @@ impl<S: PacketSink> UdpStack<S> {
                     tokio::select! {
                         r = this.run_session(src, rx) => {
                             if let Err(e) = r {
-                                debug!(%src, "udp session ended: {e}");
+                                warn!(%src, "udp session ended: {e}");
                             }
                         }
                         _ = this.cancel.cancelled() => {}

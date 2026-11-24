@@ -6,7 +6,7 @@
 //! may share a scan only if it started after their lookup began.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -90,19 +90,40 @@ pub struct Owner {
 
 #[derive(Default)]
 struct Table {
-    ports: HashMap<u16, u32>,
+    sockets: HashMap<SocketAddr, u32>,
     /// Scan start, not completion: sockets created during a scan can be missed.
     scanned: Option<Instant>,
 }
 
 impl Table {
+    fn lookup(&self, local: SocketAddr) -> Option<u32> {
+        let port = local.port();
+        if let Some(&pid) = self.sockets.get(&local) {
+            return Some(pid);
+        }
+        match local.ip() {
+            IpAddr::V4(_) => self
+                .sockets
+                .get(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
+                .or_else(|| {
+                    self.sockets
+                        .get(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
+                })
+                .copied(),
+            IpAddr::V6(_) => self
+                .sockets
+                .get(&SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port))
+                .copied(),
+        }
+    }
+
     fn owner(
         &mut self,
-        port: u16,
+        local: SocketAddr,
         asked: Instant,
-        scan: impl FnOnce() -> HashMap<u16, u32>,
+        scan: impl FnOnce() -> HashMap<SocketAddr, u32>,
     ) -> Option<u32> {
-        let found = self.ports.get(&port).copied();
+        let found = self.lookup(local);
         let fresh = self
             .scanned
             .is_some_and(|s| s.elapsed() < Duration::from_secs(1));
@@ -110,8 +131,8 @@ impl Table {
             return found;
         }
         self.scanned = Some(Instant::now());
-        self.ports = scan();
-        self.ports.get(&port).copied()
+        self.sockets = scan();
+        self.lookup(local)
     }
 }
 
@@ -144,7 +165,7 @@ impl Finder {
             } else {
                 self.udp.lock().unwrap()
             };
-            t.owner(local.port(), asked, || imp::scan(tcp))
+            t.owner(local, asked, || imp::scan(tcp))
         }?;
         let mut paths = self.paths.lock().unwrap();
         if let Some((p, at)) = paths.get(&pid)
@@ -186,6 +207,9 @@ impl Finder {
 /// Port → pid of every socket of one protocol (diagnostics).
 pub fn scan_table(tcp: bool) -> HashMap<u16, u32> {
     imp::scan(tcp)
+        .into_iter()
+        .map(|(addr, pid)| (addr.port(), pid))
+        .collect()
 }
 
 /// Executable of a process (diagnostics).
@@ -226,6 +250,7 @@ mod imp {
     //! libproc: every process's socket descriptors (needs root for other users).
     use std::collections::HashMap;
     use std::ffi::c_void;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
 
     unsafe extern "C" {
@@ -263,7 +288,7 @@ mod imp {
         i32::from_ne_bytes(b[off..off + 4].try_into().unwrap())
     }
 
-    pub fn scan(tcp: bool) -> HashMap<u16, u32> {
+    pub fn scan(tcp: bool) -> HashMap<SocketAddr, u32> {
         let mut out = HashMap::new();
         let want_proto = if tcp {
             libc::IPPROTO_TCP
@@ -319,7 +344,12 @@ mod imp {
                     // insi_lport holds the port in network byte order.
                     let port = u16::from_be(i32_at(&info, OFF_LPORT) as u16);
                     if port != 0 {
-                        out.insert(port, pid as u32);
+                        let ip: IpAddr = if family == libc::AF_INET {
+                            Ipv4Addr::UNSPECIFIED.into()
+                        } else {
+                            Ipv6Addr::UNSPECIFIED.into()
+                        };
+                        out.insert(SocketAddr::new(ip, port), pid as u32);
                     }
                 }
             }
@@ -345,30 +375,57 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    //! /proc/net/{tcp,udp}{,6} for port → socket inode, then /proc/*/fd for the owner.
+    //! /proc/net/{tcp,udp}{,6} for (local ip, port) → socket inode, then /proc/*/fd for the owner.
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
 
-    pub fn scan(tcp: bool) -> HashMap<u16, u32> {
+    /// Parses a `/proc/net/{tcp,udp}{,6}` local-address token (`HEXIP:HEXPORT`).
+    pub(super) fn parse_proc_addr(token: &str) -> Option<SocketAddr> {
+        let (hex_ip, hex_port) = token.split_once(':')?;
+        let port = u16::from_str_radix(hex_port, 16).ok()?;
+        let ip = match hex_ip.len() {
+            8 => {
+                let raw = u32::from_str_radix(hex_ip, 16).ok()?;
+                IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes()))
+            }
+            32 => {
+                let mut bytes = [0u8; 16];
+                for i in 0..4 {
+                    let word = u32::from_str_radix(&hex_ip[i * 8..(i + 1) * 8], 16).ok()?;
+                    bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_ne_bytes());
+                }
+                IpAddr::V6(Ipv6Addr::from(bytes)).to_canonical()
+            }
+            _ => return None,
+        };
+        Some(SocketAddr::new(ip, port))
+    }
+
+    pub fn scan(tcp: bool) -> HashMap<SocketAddr, u32> {
         let proto = if tcp { "tcp" } else { "udp" };
-        let mut inodes: HashMap<u64, u16> = HashMap::new();
+        let mut inodes: HashMap<u64, SocketAddr> = HashMap::new();
         for file in [format!("/proc/net/{proto}"), format!("/proc/net/{proto}6")] {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
             for line in text.lines().skip(1) {
                 let cols: Vec<&str> = line.split_whitespace().collect();
-                let (Some(local), Some(inode)) = (cols.get(1), cols.get(9)) else {
+                let (Some(local), Some(state), Some(inode)) =
+                    (cols.get(1), cols.get(3), cols.get(9))
+                else {
                     continue;
                 };
-                let port = local
-                    .rsplit(':')
-                    .next()
-                    .and_then(|p| u16::from_str_radix(p, 16).ok());
-                if let (Some(port), Ok(inode)) = (port, inode.parse::<u64>())
+                // Skip TIME_WAIT (06) and LISTEN (0A) TCP sockets so they never
+                // shadow an active flow that reuses the same port.
+                if tcp && matches!(*state, "06" | "0A") {
+                    continue;
+                }
+                if let (Some(addr), Ok(inode)) = (parse_proc_addr(local), inode.parse::<u64>())
+                    && addr.port() != 0
                     && inode != 0
                 {
-                    inodes.insert(inode, port);
+                    inodes.insert(inode, addr);
                 }
             }
         }
@@ -391,9 +448,9 @@ mod imp {
                 if let Some(inode) = link
                     .strip_prefix("socket:[")
                     .and_then(|s| s.strip_suffix(']'))
-                    && let Some(port) = inode.parse::<u64>().ok().and_then(|i| inodes.get(&i))
+                    && let Some(&addr) = inode.parse::<u64>().ok().and_then(|i| inodes.get(&i))
                 {
-                    out.insert(*port, pid);
+                    out.insert(addr, pid);
                 }
             }
         }
@@ -421,6 +478,8 @@ mod imp {
 #[derive(Clone, Copy)]
 struct RowLayout {
     size: usize,
+    addr: usize,
+    v6: bool,
     port: usize,
     pid: usize,
     /// TCP only: MIB_TCP_STATE.
@@ -431,13 +490,13 @@ struct RowLayout {
 #[cfg_attr(not(windows), allow(dead_code))]
 const TCP_TIME_WAIT: u32 = 11;
 
-/// Adds the (local port → pid) rows of an IP Helper table (a u32 count, then
+/// Adds the (local addr → pid) rows of an IP Helper table (a u32 count, then
 /// fixed-size rows). Rows without an owner (pid 0) and TIME_WAIT leftovers are
 /// skipped: a port is reused while its old connection still lingers, and the
 /// leftover must not hide the process that owns the port now (its flows
 /// would go to the proxy as "unknown").
 #[cfg_attr(not(windows), allow(dead_code))]
-fn read_rows(buf: &[u8], layout: RowLayout, out: &mut HashMap<u16, u32>) {
+fn read_rows(buf: &[u8], layout: RowLayout, out: &mut HashMap<SocketAddr, u32>) {
     let u32_at = |off: usize| u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
     if buf.len() < 4 {
         return;
@@ -454,7 +513,18 @@ fn read_rows(buf: &[u8], layout: RowLayout, out: &mut HashMap<u16, u32>) {
             .state
             .is_some_and(|s| u32_at(base + s) == TCP_TIME_WAIT);
         if port != 0 && pid != 0 && !lingering {
-            out.insert(port, pid);
+            let ip: IpAddr = if layout.v6 {
+                let octets: [u8; 16] = buf[base + layout.addr..base + layout.addr + 16]
+                    .try_into()
+                    .unwrap();
+                IpAddr::V6(Ipv6Addr::from(octets)).to_canonical()
+            } else {
+                let octets: [u8; 4] = buf[base + layout.addr..base + layout.addr + 4]
+                    .try_into()
+                    .unwrap();
+                IpAddr::V4(Ipv4Addr::from(octets))
+            };
+            out.insert(SocketAddr::new(ip, port), pid);
         }
     }
 }
@@ -463,6 +533,7 @@ fn read_rows(buf: &[u8], layout: RowLayout, out: &mut HashMap<u16, u32>) {
 mod imp {
     //! IP Helper tables with owning pids.
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
 
     use windows_sys::Win32::Foundation::{CloseHandle, NO_ERROR};
@@ -512,7 +583,7 @@ mod imp {
         vec![]
     }
 
-    pub fn scan(tcp: bool) -> HashMap<u16, u32> {
+    pub fn scan(tcp: bool) -> HashMap<SocketAddr, u32> {
         let mut out = HashMap::new();
         let layouts = if tcp {
             // MIB_TCPROW_OWNER_PID: state, laddr, lport, raddr, rport, pid
@@ -522,6 +593,8 @@ mod imp {
                     AF_INET,
                     super::RowLayout {
                         size: 24,
+                        addr: 4,
+                        v6: false,
                         port: 8,
                         pid: 20,
                         state: Some(0),
@@ -531,6 +604,8 @@ mod imp {
                     AF_INET6,
                     super::RowLayout {
                         size: 56,
+                        addr: 0,
+                        v6: true,
                         port: 20,
                         pid: 52,
                         state: Some(48),
@@ -545,6 +620,8 @@ mod imp {
                     AF_INET,
                     super::RowLayout {
                         size: 12,
+                        addr: 0,
+                        v6: false,
                         port: 4,
                         pid: 8,
                         state: None,
@@ -554,6 +631,8 @@ mod imp {
                     AF_INET6,
                     super::RowLayout {
                         size: 28,
+                        addr: 0,
+                        v6: true,
                         port: 20,
                         pid: 24,
                         state: None,
@@ -609,43 +688,48 @@ mod tests {
             &buf,
             RowLayout {
                 size: 24,
+                addr: 4,
+                v6: false,
                 port: 8,
                 pid: 20,
                 state: Some(0),
             },
             &mut out,
         );
-        assert_eq!(out, HashMap::from([(50000, 4242)]));
+        let expected: SocketAddr = "0.0.0.0:50000".parse().unwrap();
+        assert_eq!(out, HashMap::from([(expected, 4242)]));
         // A truncated table is read up to its last whole row.
         let mut out = HashMap::new();
         read_rows(
             &buf[..4 + 24 + 10],
             RowLayout {
                 size: 24,
+                addr: 4,
+                v6: false,
                 port: 8,
                 pid: 20,
                 state: Some(0),
             },
             &mut out,
         );
-        assert_eq!(out, HashMap::from([(50000, 4242)]));
+        assert_eq!(out, HashMap::from([(expected, 4242)]));
     }
 
     #[test]
     fn miss_during_scan_is_rescanned() {
         let mut table = Table::default();
+        let a: SocketAddr = "198.19.233.1:1000".parse().unwrap();
+        let b: SocketAddr = "198.19.233.1:2000".parse().unwrap();
         let mut asked_during_scan = None;
         assert_eq!(
-            table.owner(1000, Instant::now(), || {
+            table.owner(a, Instant::now(), || {
                 asked_during_scan = Some(Instant::now());
-                HashMap::from([(1000, 10)])
+                HashMap::from([(a, 10)])
             }),
             Some(10)
         );
         assert_eq!(
-            table.owner(2000, asked_during_scan.unwrap(), || HashMap::from([(
-                2000, 20
-            )])),
+            table.owner(b, asked_during_scan.unwrap(), || HashMap::from([(b, 20)])),
             Some(20)
         );
     }
@@ -653,11 +737,64 @@ mod tests {
     #[test]
     fn miss_shares_scan_started_after_lookup() {
         let mut table = Table::default();
+        let a: SocketAddr = "198.19.233.1:1000".parse().unwrap();
+        let b: SocketAddr = "198.19.233.1:2000".parse().unwrap();
         let asked = Instant::now() - Duration::from_millis(1);
-        table.owner(1000, Instant::now(), || HashMap::from([(1000, 10)]));
+        table.owner(a, Instant::now(), || HashMap::from([(a, 10)]));
         assert_eq!(
-            table.owner(2000, asked, || panic!("scan already covered this lookup")),
+            table.owner(b, asked, || panic!("scan already covered this lookup")),
             None
+        );
+    }
+
+    #[test]
+    fn same_port_on_loopback_or_uplink_does_not_collide_with_tun() {
+        let mut table = Table::default();
+        let tun_sock: SocketAddr = "198.19.233.1:40000".parse().unwrap();
+        let lo_sock: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let uplink_sock: SocketAddr = "192.168.3.77:40000".parse().unwrap();
+        let wild_v4: SocketAddr = "0.0.0.0:40001".parse().unwrap();
+        let wild_v6: SocketAddr = "[::]:40002".parse().unwrap();
+
+        let snap = HashMap::from([
+            (lo_sock, 111),     // duoray-helper / xray loopback
+            (uplink_sock, 222), // xray uplink
+            (tun_sock, 333),    // cs2 on TUN
+            (wild_v4, 444),     // udp bound to 0.0.0.0
+            (wild_v6, 555),     // dual-stack udp bound to [::]
+        ]);
+        assert_eq!(table.owner(tun_sock, Instant::now(), || snap.clone()), Some(333));
+        assert_eq!(table.lookup("198.19.233.1:40001".parse().unwrap()), Some(444));
+        assert_eq!(table.lookup("198.19.233.1:40002".parse().unwrap()), Some(555));
+        // A port owned only by 127.0.0.1 must not match a TUN flow.
+        let lo_only: SocketAddr = "127.0.0.1:40003".parse().unwrap();
+        let mut t2 = Table::default();
+        assert_eq!(
+            t2.owner("198.19.233.1:40003".parse().unwrap(), Instant::now(), || {
+                HashMap::from([(lo_only, 111)])
+            }),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_proc_net_addresses() {
+        assert_eq!(
+            imp::parse_proc_addr("0100007F:0035"),
+            Some("127.0.0.1:53".parse().unwrap())
+        );
+        assert_eq!(
+            imp::parse_proc_addr("01E913C6:9C40"),
+            Some("198.19.233.1:40000".parse().unwrap())
+        );
+        assert_eq!(
+            imp::parse_proc_addr("00000000000000000000000001000000:1F90"),
+            Some("[::1]:8080".parse().unwrap())
+        );
+        assert_eq!(
+            imp::parse_proc_addr("0000000000000000FFFF000001E913C6:9C40"),
+            Some("198.19.233.1:40000".parse().unwrap())
         );
     }
 
