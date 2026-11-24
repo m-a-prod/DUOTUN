@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{SysConfig, UndoLog, run, run_full};
 
@@ -31,19 +31,7 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     }
 
     // 1. Proxy servers keep using the physical uplink; must precede the split routes.
-    for ip in &cfg.bypass {
-        let route = match ip {
-            IpAddr::V4(_) => &v4,
-            IpAddr::V6(_) => match &v6 {
-                Some(r) => r,
-                None => {
-                    warn!("no IPv6 default route, cannot bypass {ip}");
-                    continue;
-                }
-            },
-        };
-        add_host_route(*ip, route, log)?;
-    }
+    add_bypass_routes(&cfg.bypass, &v4, v6.as_ref(), log)?;
 
     // 2. Everything else into the TUN. Two /1 halves beat 0.0.0.0/0 without touching the default route.
     let tun = cfg.tun_name.as_str();
@@ -146,11 +134,37 @@ fn route_private_nets(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     for cidr in super::private_split_routes(&routes) {
         let half = cidr.format();
         if cidr.is_ipv4() {
-            log.push_cmd(&["/sbin/route", "-n", "delete", "-net", &half, "-interface", tun])?;
+            log.push_cmd(&[
+                "/sbin/route",
+                "-n",
+                "delete",
+                "-net",
+                &half,
+                "-interface",
+                tun,
+            ])?;
             run(&["/sbin/route", "-n", "add", "-net", &half, "-interface", tun])?;
         } else {
-            log.push_cmd(&["/sbin/route", "-n", "delete", "-inet6", "-net", &half, "-interface", tun])?;
-            run(&["/sbin/route", "-n", "add", "-inet6", "-net", &half, "-interface", tun])?;
+            log.push_cmd(&[
+                "/sbin/route",
+                "-n",
+                "delete",
+                "-inet6",
+                "-net",
+                &half,
+                "-interface",
+                tun,
+            ])?;
+            run(&[
+                "/sbin/route",
+                "-n",
+                "add",
+                "-inet6",
+                "-net",
+                &half,
+                "-interface",
+                tun,
+            ])?;
         }
         info!("private route {half} -> {tun}");
     }
@@ -259,6 +273,44 @@ fn add_host_route(ip: IpAddr, via: &DefaultRoute, log: &mut UndoLog) -> Result<(
     }
     info!("bypass {ip} -> {}", via.iface);
     Ok(())
+}
+
+fn add_bypass_routes(
+    ips: &[IpAddr],
+    v4: &DefaultRoute,
+    v6: Option<&DefaultRoute>,
+    log: &mut UndoLog,
+) -> Result<()> {
+    for ip in ips {
+        let route = match ip {
+            IpAddr::V4(_) => v4,
+            IpAddr::V6(_) => match v6 {
+                Some(r) => r,
+                None => {
+                    warn!("no IPv6 default route, cannot bypass {ip}");
+                    continue;
+                }
+            },
+        };
+        add_host_route(*ip, route, log)?;
+    }
+    Ok(())
+}
+
+pub fn add_bypass(_tun: &str, ips: &[IpAddr], log: &mut UndoLog) -> Result<()> {
+    let v4 = default_route(false).context("no IPv4 default route")?;
+    let v6 = default_route(true).ok();
+    add_bypass_routes(ips, &v4, v6.as_ref(), log)
+}
+
+pub fn remove_bypass(_tun: &str, ips: &[IpAddr]) {
+    for ip in ips {
+        let family = if ip.is_ipv4() { "-inet" } else { "-inet6" };
+        let ip_s = ip.to_string();
+        if let Err(e) = run(&["/sbin/route", "-n", "delete", family, "-host", &ip_s]) {
+            debug!("remove bypass {ip_s} failed (usually harmless): {e}");
+        }
+    }
 }
 
 fn set_dns(server: &str, log: &mut UndoLog) -> Result<()> {

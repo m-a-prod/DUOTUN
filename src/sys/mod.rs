@@ -77,6 +77,34 @@ pub fn refresh(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
     }
 }
 
+/// Updates the bypass host routes in place without touching the TUN, default
+/// split routes, DNS or firewall. Adds new IPs first, then removes old ones.
+pub fn update_bypass(
+    cfg: &mut SysConfig,
+    new_bypass: Vec<IpAddr>,
+    log: &mut UndoLog,
+) -> Result<()> {
+    let to_add: Vec<IpAddr> = new_bypass
+        .iter()
+        .copied()
+        .filter(|ip| !cfg.bypass.contains(ip))
+        .collect();
+    let to_remove: Vec<IpAddr> = cfg
+        .bypass
+        .iter()
+        .copied()
+        .filter(|ip| !new_bypass.contains(ip))
+        .collect();
+    if !to_add.is_empty() {
+        imp::add_bypass(&cfg.tun_name, &to_add, log)?;
+    }
+    cfg.bypass = new_bypass;
+    if !to_remove.is_empty() {
+        imp::remove_bypass(&cfg.tun_name, &to_remove);
+    }
+    Ok(())
+}
+
 /// Reverts changes left behind by a previous run that did not exit cleanly.
 pub fn recover() {
     let path = state_path();
@@ -139,7 +167,15 @@ impl UndoLog {
     }
 
     pub fn push_cmd(&mut self, argv: &[&str]) -> Result<()> {
-        self.push(Undo::Cmd(argv.iter().map(|s| s.to_string()).collect()))
+        let cmd: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        if self
+            .steps
+            .iter()
+            .any(|s| matches!(s, Undo::Cmd(existing) if existing == &cmd))
+        {
+            return Ok(());
+        }
+        self.push(Undo::Cmd(cmd))
     }
 
     fn persist(&self) -> Result<()> {
@@ -309,8 +345,14 @@ impl Cidr {
                 let bit = 1u32 << (31 - self.prefix);
                 let second = Ipv4Addr::from(u32::from(net) | bit);
                 Some([
-                    Self { net: IpAddr::V4(net), prefix: p },
-                    Self { net: IpAddr::V4(second), prefix: p },
+                    Self {
+                        net: IpAddr::V4(net),
+                        prefix: p,
+                    },
+                    Self {
+                        net: IpAddr::V4(second),
+                        prefix: p,
+                    },
                 ])
             }
             IpAddr::V6(a) if self.prefix < 128 => {
@@ -319,8 +361,14 @@ impl Cidr {
                 let bit = 1u128 << (127 - self.prefix);
                 let second = Ipv6Addr::from(u128::from(net) | bit);
                 Some([
-                    Self { net: IpAddr::V6(net), prefix: p },
-                    Self { net: IpAddr::V6(second), prefix: p },
+                    Self {
+                        net: IpAddr::V6(net),
+                        prefix: p,
+                    },
+                    Self {
+                        net: IpAddr::V6(second),
+                        prefix: p,
+                    },
                 ])
             }
             _ => None,
@@ -336,18 +384,30 @@ fn mask_ip(ip: IpAddr, prefix: u8) -> IpAddr {
 }
 
 fn mask_v4(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
-    let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
     Ipv4Addr::from(u32::from(ip) & mask)
 }
 
 fn mask_v6(ip: Ipv6Addr, prefix: u8) -> Ipv6Addr {
-    let mask = if prefix == 0 { 0 } else { !0u128 << (128 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !0u128 << (128 - prefix)
+    };
     Ipv6Addr::from(u128::from(ip) & mask)
 }
 
 #[cfg(any(windows, test))]
 pub fn ipv4_netmask(prefix: u8) -> Ipv4Addr {
-    let mask = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
     Ipv4Addr::from(mask)
 }
 
@@ -376,24 +436,36 @@ fn is_private_candidate(c: Cidr) -> bool {
             if !(2..=30).contains(&c.prefix) {
                 return false;
             }
-            let priv_match = V4_PRIVATE
-                .iter()
-                .any(|&(ip, p)| c.overlaps(Cidr { net: IpAddr::V4(ip), prefix: p }));
-            let excl_match = V4_EXCLUDED
-                .iter()
-                .any(|&(ip, p)| c.overlaps(Cidr { net: IpAddr::V4(ip), prefix: p }));
+            let priv_match = V4_PRIVATE.iter().any(|&(ip, p)| {
+                c.overlaps(Cidr {
+                    net: IpAddr::V4(ip),
+                    prefix: p,
+                })
+            });
+            let excl_match = V4_EXCLUDED.iter().any(|&(ip, p)| {
+                c.overlaps(Cidr {
+                    net: IpAddr::V4(ip),
+                    prefix: p,
+                })
+            });
             priv_match && !excl_match
         }
         IpAddr::V6(_) => {
             if !(2..=126).contains(&c.prefix) {
                 return false;
             }
-            let priv_match = V6_PRIVATE
-                .iter()
-                .any(|&(ip, p)| c.overlaps(Cidr { net: IpAddr::V6(ip), prefix: p }));
-            let excl_match = V6_EXCLUDED
-                .iter()
-                .any(|&(ip, p)| c.overlaps(Cidr { net: IpAddr::V6(ip), prefix: p }));
+            let priv_match = V6_PRIVATE.iter().any(|&(ip, p)| {
+                c.overlaps(Cidr {
+                    net: IpAddr::V6(ip),
+                    prefix: p,
+                })
+            });
+            let excl_match = V6_EXCLUDED.iter().any(|&(ip, p)| {
+                c.overlaps(Cidr {
+                    net: IpAddr::V6(ip),
+                    prefix: p,
+                })
+            });
             priv_match && !excl_match
         }
     }
@@ -553,7 +625,10 @@ mod tests {
             c("8.8.8.0/24"),
             c("2001:db8::/32"),
         ];
-        let got: Vec<String> = private_split_routes(&input).into_iter().map(Cidr::format).collect();
+        let got: Vec<String> = private_split_routes(&input)
+            .into_iter()
+            .map(Cidr::format)
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -574,15 +649,14 @@ mod tests {
     #[test]
     fn nested_private_route_skips_overridden_half() {
         let input = [c("192.168.0.0/23"), c("192.168.0.0/24")];
-        let got: Vec<String> = private_split_routes(&input).into_iter().map(Cidr::format).collect();
+        let got: Vec<String> = private_split_routes(&input)
+            .into_iter()
+            .map(Cidr::format)
+            .collect();
         // 192.168.0.0/24 is already in `matching` (so its own /25 halves beat it).
         assert_eq!(
             got,
-            vec![
-                "192.168.0.0/25",
-                "192.168.0.128/25",
-                "192.168.1.0/24",
-            ]
+            vec!["192.168.0.0/25", "192.168.0.128/25", "192.168.1.0/24",]
         );
     }
 

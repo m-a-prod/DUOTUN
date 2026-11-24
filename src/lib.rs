@@ -11,11 +11,12 @@ pub mod udp;
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tun_rs::{AsyncDevice, DeviceBuilder};
@@ -93,6 +94,35 @@ impl PacketSink for TunSink {
     }
 }
 
+/// New upstream SOCKS, bypass routes and per-app rules for [`TunHandle::switch`].
+#[derive(Debug, Clone)]
+pub struct SwitchUpdate {
+    pub socks: Socks5,
+    pub bypass: Vec<IpAddr>,
+    pub apps: Option<AppRules>,
+    pub direct_socks: Option<Socks5>,
+}
+
+/// Control handle to a running TUN session (hot-swapping upstream without
+/// recreating the TUN device, routes, DNS or firewall).
+#[derive(Clone)]
+pub struct TunHandle {
+    tx: mpsc::Sender<(SwitchUpdate, oneshot::Sender<Result<()>>)>,
+}
+
+impl TunHandle {
+    pub async fn switch(&self, update: SwitchUpdate) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send((update, reply_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("tunnel has stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("tunnel stopped during switch"))?
+    }
+}
+
 /// Runs until `shutdown` resolves or a fatal error occurs. System settings are
 /// always restored before returning.
 pub async fn run(cfg: Config, shutdown: impl Future<Output = ()>) -> Result<()> {
@@ -105,6 +135,16 @@ pub async fn run_notify(
     cfg: Config,
     shutdown: impl Future<Output = ()>,
     ready: impl FnOnce(String),
+) -> Result<()> {
+    run_with_handle(cfg, shutdown, |name, _handle| ready(name)).await
+}
+
+/// Like [`run_notify`], and also passes a [`TunHandle`] for hot-swapping the
+/// upstream proxy, bypass routes and per-app rules in place.
+pub async fn run_with_handle(
+    cfg: Config,
+    shutdown: impl Future<Output = ()>,
+    ready: impl FnOnce(String, TunHandle),
 ) -> Result<()> {
     raise_fd_limit();
     let started = std::time::Instant::now();
@@ -181,17 +221,18 @@ pub async fn run_notify(
         warn!("no --bypass given: xray's connection to its server will loop into the TUN");
     }
 
-    let sys_cfg = sys::SysConfig {
+    let sys_cfg = Arc::new(Mutex::new(sys::SysConfig {
         tun_name: tun_name.clone(),
         dns: cfg.v4_peer,
         ipv6: cfg.v6.map(|(a, _)| a),
         bypass,
         strict_dns: cfg.strict_dns,
         route_private: cfg.route_private,
-    };
+    }));
     let applying = std::time::Instant::now();
     let undo = if cfg.auto_route {
-        Some(Arc::new(Mutex::new(sys::apply(&sys_cfg)?)))
+        let initial = sys_cfg.lock().unwrap().clone();
+        Some(Arc::new(Mutex::new(sys::apply(&initial)?)))
     } else {
         None
     };
@@ -200,11 +241,12 @@ pub async fn run_notify(
         applying.elapsed().as_secs_f32()
     );
 
-    ready(tun_name.clone());
+    let (switch_tx, switch_rx) = mpsc::channel(8);
+    ready(tun_name.clone(), TunHandle { tx: switch_tx });
     let cancel = CancellationToken::new();
     let result = tokio::select! {
-        r = serve(&cfg, dev.clone(), l4, l6, cancel.clone()) => r,
-        _ = follow_network(&sys_cfg, undo.clone()) => Ok(()),
+        r = serve(&cfg, dev.clone(), l4, l6, sys_cfg.clone(), undo.clone(), switch_rx, cancel.clone()) => r,
+        _ = follow_network(sys_cfg.clone(), undo.clone()) => Ok(()),
         _ = shutdown => {
             info!("shutting down");
             Ok(())
@@ -226,7 +268,10 @@ pub async fn run_notify(
 }
 
 /// Keeps routes in line with the uplink while the tunnel is up. Never returns.
-async fn follow_network(cfg: &sys::SysConfig, undo: Option<Arc<Mutex<sys::UndoLog>>>) {
+async fn follow_network(
+    sys_cfg: Arc<Mutex<sys::SysConfig>>,
+    undo: Option<Arc<Mutex<sys::UndoLog>>>,
+) {
     // Only Linux follows the uplink so far; elsewhere this just waits.
     let Some(undo) = undo.filter(|_| cfg!(target_os = "linux")) else {
         return std::future::pending().await;
@@ -235,33 +280,36 @@ async fn follow_network(cfg: &sys::SysConfig, undo: Option<Arc<Mutex<sys::UndoLo
     tick.tick().await;
     loop {
         tick.tick().await;
-        let (cfg, undo) = (cfg.clone(), undo.clone());
-        let r = tokio::task::spawn_blocking(move || sys::refresh(&cfg, &mut undo.lock().unwrap()))
-            .await;
+        let (sys_cfg, undo) = (sys_cfg.clone(), undo.clone());
+        let r = tokio::task::spawn_blocking(move || {
+            let cfg = sys_cfg.lock().unwrap();
+            let mut log = undo.lock().unwrap();
+            sys::refresh(&cfg, &mut log)
+        })
+        .await;
         if let Ok(Err(e)) = r {
             warn!("network refresh failed: {e:#}");
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     cfg: &Config,
     dev: Arc<AsyncDevice>,
     l4: TcpListener,
     l6: Option<TcpListener>,
+    sys_cfg: Arc<Mutex<sys::SysConfig>>,
+    undo: Option<Arc<Mutex<sys::UndoLog>>>,
+    mut switch_rx: mpsc::Receiver<(SwitchUpdate, oneshot::Sender<Result<()>>)>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let socks = Arc::new(cfg.socks.clone());
-    let routes = Arc::new(Routes {
-        proxy: socks.clone(),
-        apps: match (&cfg.apps, &cfg.direct_socks) {
-            (Some(rules), Some(direct)) => {
-                info!(mode = ?rules.mode, apps = ?rules.apps, "per-app routing");
-                Some((AppRouter::new(rules.clone()), Arc::new(direct.clone())))
-            }
-            _ => None,
-        },
-    });
+    let routes = Arc::new(Routes::new(
+        socks.clone(),
+        build_apps(cfg.apps.as_ref(), cfg.direct_socks.as_ref()),
+    ));
+    let (dns_tx, dns_rx) = watch::channel(socks.clone());
     let nat = Arc::new(Nat::default());
     let tcp = TcpStack {
         nat: nat.clone(),
@@ -283,9 +331,58 @@ async fn serve(
     let udp = UdpStack::new(sink.clone(), routes.clone(), cancel.clone());
     let dns = cfg
         .dns
-        .map(|upstream| Dns::spawn(sink.clone(), socks.clone(), upstream, cancel.clone()));
+        .map(|upstream| Dns::spawn(sink.clone(), dns_rx, upstream, cancel.clone()));
 
     let mut tasks = tokio::task::JoinSet::new();
+    {
+        let routes = routes.clone();
+        let cancel = cancel.clone();
+        let auto_route = cfg.auto_route;
+        tasks.spawn(async move {
+            loop {
+                let item = tokio::select! {
+                    item = switch_rx.recv() => item,
+                    _ = cancel.cancelled() => return Ok(()),
+                };
+                let Some((update, reply)) = item else {
+                    cancel.cancelled().await;
+                    return Ok(());
+                };
+                let mut bypass = update.bypass;
+                let socks_ip = update.socks.server.ip();
+                if !socks_ip.is_loopback() && !bypass.contains(&socks_ip) {
+                    bypass.push(socks_ip);
+                }
+                let route_res = if auto_route
+                    && let Some(undo) = undo.clone()
+                {
+                    let sys_cfg = sys_cfg.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let mut cfg = sys_cfg.lock().unwrap();
+                        let mut log = undo.lock().unwrap();
+                        sys::update_bypass(&mut cfg, bypass, &mut log)
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow::anyhow!("bypass update panicked: {e}")),
+                    }
+                } else {
+                    Ok(())
+                };
+                if let Err(e) = route_res {
+                    let _ = reply.send(Err(e));
+                    continue;
+                }
+                let new_socks = Arc::new(update.socks);
+                let new_apps = build_apps(update.apps.as_ref(), update.direct_socks.as_ref());
+                routes.update(new_socks.clone(), new_apps);
+                let _ = dns_tx.send(new_socks.clone());
+                info!(socks = %new_socks.server, "switched TUN upstream in place");
+                let _ = reply.send(Ok(()));
+            }
+        });
+    }
     tasks.spawn(tcp::serve(
         l4,
         nat.clone(),
@@ -354,22 +451,54 @@ async fn serve(
     }
 }
 
-/// Which SOCKS a flow goes through.
+fn build_apps(
+    apps: Option<&AppRules>,
+    direct: Option<&Socks5>,
+) -> Option<(Arc<AppRouter>, Arc<Socks5>)> {
+    match (apps, direct) {
+        (Some(rules), Some(direct)) => {
+            info!(mode = ?rules.mode, apps = ?rules.apps, "per-app routing");
+            Some((AppRouter::new(rules.clone()), Arc::new(direct.clone())))
+        }
+        _ => None,
+    }
+}
+
+struct RoutesState {
+    proxy: Arc<Socks5>,
+    apps: Option<(Arc<AppRouter>, Arc<Socks5>)>,
+}
+
+/// Which SOCKS a flow goes through. Swapped atomically on [`TunHandle::switch`].
 pub struct Routes {
-    pub proxy: Arc<Socks5>,
-    /// Per-app routing and the direct SOCKS.
-    pub apps: Option<(Arc<AppRouter>, Arc<Socks5>)>,
+    state: RwLock<Arc<RoutesState>>,
 }
 
 impl Routes {
+    fn new(proxy: Arc<Socks5>, apps: Option<(Arc<AppRouter>, Arc<Socks5>)>) -> Self {
+        Self {
+            state: RwLock::new(Arc::new(RoutesState { proxy, apps })),
+        }
+    }
+
+    fn update(&self, proxy: Arc<Socks5>, apps: Option<(Arc<AppRouter>, Arc<Socks5>)>) {
+        *self.state.write().unwrap() = Arc::new(RoutesState { proxy, apps });
+    }
+
+    /// Current default proxy SOCKS (used for DNS and non-bypass flows).
+    pub fn proxy(&self) -> Arc<Socks5> {
+        self.state.read().unwrap().proxy.clone()
+    }
+
     /// The SOCKS for a new flow from the app socket `src`.
-    pub async fn pick(&self, src: SocketAddr, tcp: bool) -> &Arc<Socks5> {
-        if let Some((router, direct)) = &self.apps
+    pub async fn pick(&self, src: SocketAddr, tcp: bool) -> Arc<Socks5> {
+        let state = self.state.read().unwrap().clone();
+        if let Some((router, direct)) = &state.apps
             && router.is_direct(src, tcp).await
         {
-            return direct;
+            return direct.clone();
         }
-        &self.proxy
+        state.proxy.clone()
     }
 }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
@@ -43,7 +43,7 @@ pub struct Dns {
 impl Dns {
     pub fn spawn<S: PacketSink>(
         sink: Arc<S>,
-        socks: Arc<Socks5>,
+        socks: watch::Receiver<Arc<Socks5>>,
         upstream: SocketAddr,
         cancel: CancellationToken,
     ) -> Self {
@@ -76,7 +76,7 @@ impl Dns {
 async fn worker<S: PacketSink>(
     mut rx: mpsc::Receiver<Query>,
     sink: Arc<S>,
-    socks: Arc<Socks5>,
+    mut socks: watch::Receiver<Arc<Socks5>>,
     upstream: SocketAddr,
 ) {
     let mut pending: HashMap<u16, Pending> = HashMap::new();
@@ -87,7 +87,8 @@ async fn worker<S: PacketSink>(
     loop {
         // Connect lazily: wait for demand first so a dead proxy is not hammered.
         let Some(first) = rx.recv().await else { return };
-        let assoc = match socks.udp_associate().await {
+        let current = socks.borrow_and_update().clone();
+        let assoc = match current.udp_associate().await {
             Ok(a) => a,
             Err(e) => {
                 warn!("dns: udp associate failed: {e}");
@@ -96,7 +97,7 @@ async fn worker<S: PacketSink>(
             }
         };
         let socks5::UdpAssociation { mut ctrl, socket } = assoc;
-        debug!(%upstream, "dns association open");
+        debug!(%upstream, socks = %current.server, "dns association open");
 
         let mut backlog = Some(first);
         let mut sweep = tokio::time::interval(Duration::from_secs(1));
@@ -108,6 +109,10 @@ async fn worker<S: PacketSink>(
                         Some(q) => Some(q),
                         None => return,
                     },
+                    Ok(()) = socks.changed() => {
+                        debug!("dns: upstream socks switched, reopening association");
+                        break;
+                    }
                     n = socket.recv(&mut buf) => {
                         match n {
                             Ok(n) => deliver(&buf[..n], &mut pending, &*sink).await,
@@ -213,9 +218,10 @@ mod tests {
             server: "127.0.0.1:17080".parse().unwrap(),
             auth: None,
         });
+        let (_, socks_rx) = watch::channel(socks);
         let dns = Dns::spawn(
             sink.clone(),
-            socks,
+            socks_rx,
             "1.1.1.1:53".parse().unwrap(),
             CancellationToken::new(),
         );

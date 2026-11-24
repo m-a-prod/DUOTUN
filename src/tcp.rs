@@ -131,12 +131,12 @@ pub async fn serve(
         tokio::spawn(async move {
             // DNS always goes through the proxy, whichever app asks.
             let socks = if is_dns {
-                &routes.proxy
+                routes.proxy()
             } else {
                 routes.pick(flow.src, true).await
             };
             tokio::select! {
-                r = relay(stream, target, socks) => {
+                r = relay(stream, target, &socks) => {
                     if let Err(e) = r {
                         debug!(src = %flow.src, dst = %target, "tcp relay ended: {e}");
                     }

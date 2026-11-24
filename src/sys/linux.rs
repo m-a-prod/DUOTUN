@@ -140,7 +140,16 @@ fn route_bypass(
     v6: Option<&DefaultRoute>,
     log: &mut UndoLog,
 ) -> Result<()> {
-    for ip in &cfg.bypass {
+    route_bypass_ips(&cfg.bypass, v4, v6, log)
+}
+
+fn route_bypass_ips(
+    ips: &[IpAddr],
+    v4: &DefaultRoute,
+    v6: Option<&DefaultRoute>,
+    log: &mut UndoLog,
+) -> Result<()> {
+    for ip in ips {
         let (route, family, prefix) = match ip {
             IpAddr::V4(_) => (v4, "-4", 32),
             IpAddr::V6(_) => match v6 {
@@ -162,6 +171,32 @@ fn route_bypass(
         info!("bypass {ip} -> {}", route.dev);
     }
     Ok(())
+}
+
+pub fn add_bypass(tun: &str, ips: &[IpAddr], log: &mut UndoLog) -> Result<()> {
+    let cached = UPLINK.lock().unwrap().clone();
+    let (v4, v6) = match cached {
+        Some((v4, v6)) => (v4, v6),
+        None => {
+            let v4 = default_route(false, tun).context("no IPv4 default route")?;
+            let v6 = default_route(true, tun).ok();
+            (v4, v6)
+        }
+    };
+    route_bypass_ips(ips, &v4, v6.as_ref(), log)
+}
+
+pub fn remove_bypass(_tun: &str, ips: &[IpAddr]) {
+    for ip in ips {
+        let (family, prefix) = match ip {
+            IpAddr::V4(_) => ("-4", 32),
+            IpAddr::V6(_) => ("-6", 128),
+        };
+        let dst = format!("{ip}/{prefix}");
+        if let Err(e) = run(&["ip", family, "route", "del", &dst]) {
+            debug!("remove bypass {dst} failed (usually harmless): {e}");
+        }
+    }
 }
 
 /// The effective mode is max(all, dev): strict (1) drops replies to sockets

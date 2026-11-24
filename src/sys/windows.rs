@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{SysConfig, UndoLog, run};
 
@@ -96,15 +96,13 @@ struct DefaultRoute {
     alias: String,
 }
 
-pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
-    let tun = cfg.tun_name.as_str();
-    let tun_index = adapter_index(tun)?;
-    let v4 = default_route(false, tun_index).context("no IPv4 default route")?;
-    let v6 = default_route(true, tun_index).ok();
-    info!("uplink: {} via {}", v4.alias, v4.gateway);
-
-    // 1. Proxy servers keep using the physical uplink.
-    for ip in &cfg.bypass {
+fn add_bypass_routes(
+    ips: &[IpAddr],
+    v4: &DefaultRoute,
+    v6: Option<&DefaultRoute>,
+    log: &mut UndoLog,
+) -> Result<()> {
+    for ip in ips {
         let ip_s = ip.to_string();
         match ip {
             IpAddr::V4(_) => {
@@ -123,7 +121,7 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
                 ])?;
             }
             IpAddr::V6(_) => {
-                let Some(r) = &v6 else {
+                let Some(r) = v6 else {
                     warn!("no IPv6 default route, cannot bypass {ip}");
                     continue;
                 };
@@ -145,6 +143,52 @@ pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
         }
         info!("bypass {ip}");
     }
+    Ok(())
+}
+
+pub fn add_bypass(tun: &str, ips: &[IpAddr], log: &mut UndoLog) -> Result<()> {
+    let tun_index = adapter_index(tun)?;
+    let v4 = default_route(false, tun_index).context("no IPv4 default route")?;
+    let v6 = default_route(true, tun_index).ok();
+    add_bypass_routes(ips, &v4, v6.as_ref(), log)
+}
+
+pub fn remove_bypass(tun: &str, ips: &[IpAddr]) {
+    let v6_idx = adapter_index(tun)
+        .ok()
+        .and_then(|idx| default_route(true, idx).ok())
+        .map(|r| r.if_index.to_string());
+    for ip in ips {
+        let ip_s = ip.to_string();
+        match ip {
+            IpAddr::V4(_) => {
+                if let Err(e) = run(&["route", "DELETE", &ip_s]) {
+                    debug!("remove bypass {ip_s} failed (usually harmless): {e}");
+                }
+            }
+            IpAddr::V6(_) => {
+                if let Some(idx) = &v6_idx {
+                    let dst = format!("{ip_s}/128");
+                    if let Err(e) =
+                        run(&["netsh", "interface", "ipv6", "delete", "route", &dst, idx])
+                    {
+                        debug!("remove bypass {dst} failed (usually harmless): {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn apply(cfg: &SysConfig, log: &mut UndoLog) -> Result<()> {
+    let tun = cfg.tun_name.as_str();
+    let tun_index = adapter_index(tun)?;
+    let v4 = default_route(false, tun_index).context("no IPv4 default route")?;
+    let v6 = default_route(true, tun_index).ok();
+    info!("uplink: {} via {}", v4.alias, v4.gateway);
+
+    // 1. Proxy servers keep using the physical uplink.
+    add_bypass_routes(&cfg.bypass, &v4, v6.as_ref(), log)?;
 
     // The kernel hands NATed TCP to our listener on the TUN address; Windows
     // Firewall drops such inbound connections on an unknown network otherwise.
@@ -420,21 +464,20 @@ fn route_private_nets(
                 let mask_s = super::ipv4_netmask(cidr.prefix).to_string();
                 log.push_cmd(&["route", "DELETE", &net_s, "MASK", &mask_s, peer])?;
                 run(&[
-                    "route",
-                    "ADD",
-                    &net_s,
-                    "MASK",
-                    &mask_s,
-                    peer,
-                    "IF",
-                    tun_idx,
-                    "METRIC",
-                    "1",
+                    "route", "ADD", &net_s, "MASK", &mask_s, peer, "IF", tun_idx, "METRIC", "1",
                 ])?;
             }
             IpAddr::V6(_) => {
                 let cidr_s = cidr.format();
-                log.push_cmd(&["netsh", "interface", "ipv6", "delete", "route", &cidr_s, tun_idx])?;
+                log.push_cmd(&[
+                    "netsh",
+                    "interface",
+                    "ipv6",
+                    "delete",
+                    "route",
+                    &cidr_s,
+                    tun_idx,
+                ])?;
                 run(&[
                     "netsh",
                     "interface",
@@ -479,7 +522,15 @@ fn collect_routes(v6: bool, tun_index: u32) -> Vec<super::Cidr> {
             if v6 {
                 IpAddr::from(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte)
             } else {
-                IpAddr::from(row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes())
+                IpAddr::from(
+                    row.DestinationPrefix
+                        .Prefix
+                        .Ipv4
+                        .sin_addr
+                        .S_un
+                        .S_addr
+                        .to_ne_bytes(),
+                )
             }
         };
         if let Some(cidr) = super::Cidr::new(ip, prefix) {
